@@ -72,6 +72,15 @@ from .prompt import (
     EVIDENCE_SCHEMA,
     FINAL_ANSWER_SCHEMA,
     MCQ_SCHEMA,
+    AUDIO_ENRICHMENT_SCHEMA,
+    REFLECTION_SCHEMA,
+)
+
+# AAVP audio extraction utilities (ffmpeg-based, no local ASR)
+from .audio_utils import (
+    extract_audio_snippet,
+    generate_gap_probes,
+    cleanup_audio_artifacts,
 )
 
 # Import video utilities
@@ -106,18 +115,56 @@ class SpatialTokenRate(str, Enum):
     medium = "medium"
 
 
+class AudioEnrichmentScope(str, Enum):
+    """Controls whether and how audio enrichment runs after the visual observation.
+
+    off               — No audio; original AVP behaviour (default).
+    evidence_only     — Extract audio around each key_evidence timestamp returned
+                        by the visual pass and send to Gemini for interpretation.
+    evidence_plus_gaps — Same as evidence_only, plus sparse probes at the
+                        midpoints of large uncovered timeline gaps, catching
+                        off-screen narration or sounds missed by the visual pass.
+    """
+    off = "off"
+    evidence_only = "evidence_only"
+    evidence_plus_gaps = "evidence_plus_gaps"
+
+
+class AudioMode(str, Enum):
+    """Steers the audio interpretation prompt toward speech or sound events.
+
+    balanced       — Both verbatim ASR transcription and acoustic event tagging.
+    asr_focus      — Prioritise verbatim speech transcription (reasoning queries).
+    acoustic_focus — Prioritise non-speech event detection (event-tracking queries).
+    """
+    balanced = "balanced"
+    asr_focus = "asr_focus"
+    acoustic_focus = "acoustic_focus"
+
+
 @dataclass
 class WatchConfig:
-    """Configuration for video observation, specifying region and sampling granularity.
-    
-    Contains:
-    - Region: load_mode ("uniform" for full video, "region" for temporal spans) and regions (list of [start, end] tuples)
-    - Sampling granularity: fps (temporal sampling rate) and spatial_token_rate (spatial resolution)
+    """Configuration for one observation round.
+
+    Visual controls (unchanged from AVP):
+    - load_mode:          "uniform" (full video) | "region" (specific spans)
+    - fps:                Temporal sampling rate in frames per second
+    - spatial_token_rate: Spatial resolution ("low" | "medium")
+    - regions:            [(start_sec, end_sec)] used only when load_mode="region"
+
+    AAVP audio enrichment controls (post-observation, default-off):
+    - audio_enrichment:         Scope of post-visual audio extraction
+    - audio_mode:               Focus of the audio interpretation prompt
+    - audio_snippet_halfwidth_sec: Half-width of the WAV window per timestamp (s)
     """
-    load_mode: str                      # "uniform" | "region" - specifies whether to scan full video or specific regions
-    fps: float                          # Temporal sampling rate (frames per second)
-    spatial_token_rate: SpatialTokenRate  # Spatial resolution ("low" or "medium")
-    regions: List[Tuple[float, float]] = field(default_factory=list)  # Temporal spans: [(start_sec, end_sec), ...]
+    load_mode: str                        # "uniform" | "region"
+    fps: float
+    spatial_token_rate: SpatialTokenRate
+    regions: List[Tuple[float, float]] = field(default_factory=list)
+    # --- AAVP additions ---
+    audio_enrichment: AudioEnrichmentScope = AudioEnrichmentScope.off
+    audio_mode: AudioMode = AudioMode.balanced
+    audio_snippet_halfwidth_sec: float = 2.5  # 5 s total window per evidence timestamp
 
 
 @dataclass
@@ -139,26 +186,95 @@ class PlanSpec:
 
 
 @dataclass
+class AudioEnrichment:
+    """Audio evidence gathered for a single timestamp from the visual pass.
+
+    One ``AudioEnrichment`` corresponds to one WAV snippet extracted by
+    ``audio_utils.extract_audio_snippet`` and interpreted by Gemini.
+
+    Fields:
+        center_sec:       Midpoint of the audio window in original video seconds.
+        window_start_sec: Actual extraction start (= center_sec - halfwidth, clamped).
+        window_end_sec:   Actual extraction end  (= center_sec + halfwidth).
+        speech_evidence:  Verbatim word-bounded transcript; empty string if inaudible.
+        acoustic_evidence: Closed-tag acoustic labels drawn from the config vocabulary.
+        source:           "evidence" (from key_evidence) or "gap_probe".
+    """
+    center_sec: float
+    window_start_sec: float
+    window_end_sec: float
+    speech_evidence: str = ""
+    acoustic_evidence: List[str] = field(default_factory=list)
+    source: str = "evidence"  # "evidence" | "gap_probe"
+
+
+@dataclass
 class Evidence:
     """Evidence gathered from one observation round.
-    
-    Contains:
-    - detailed_response: Analysis and observations
-    - key_evidence: List of [timestamp_start, timestamp_end, description] intervals
-    - reasoning: Explanation of findings
+
+    Visual fields (unchanged from AVP):
+    - detailed_response: Full analysis text from the visual model call
+    - key_evidence:      Timestamp intervals [timestamp_start, timestamp_end, description]
+    - reasoning:         Model's explanation of findings
+    - frames_used:       Video segments submitted to the model
+    - model_call:        API call metadata
+    - timestamp:         ISO timestamp of collection
+    - round_id:          Which iteration round produced this evidence
+
+    AAVP addition:
+    - audio_enrichments: Per-timestamp audio results from the post-visual enrichment
+                         step (empty list when audio_enrichment=off).
     """
-    detailed_response: str = ""  # Detailed analysis and observations
-    key_evidence: List[Dict[str, Any]] = field(default_factory=list)  # Timestamp intervals with descriptions
-    reasoning: str = ""  # Explanation of findings
-    frames_used: List[Dict[str, Any]] = field(default_factory=list)  # Video segments analyzed
-    model_call: Dict[str, Any] = field(default_factory=dict)  # API call metadata
-    timestamp: str = ""  # When evidence was collected
-    round_id: int = 0  # Which round this evidence is from
-    
+    detailed_response: str = ""
+    key_evidence: List[Dict[str, Any]] = field(default_factory=list)
+    reasoning: str = ""
+    frames_used: List[Dict[str, Any]] = field(default_factory=list)
+    model_call: Dict[str, Any] = field(default_factory=dict)
+    timestamp: str = ""
+    round_id: int = 0
+    # --- AAVP addition ---
+    audio_enrichments: List[AudioEnrichment] = field(default_factory=list)
+
     @property
     def step_id(self) -> str:
         """Compatibility property: returns round_id as string."""
         return str(self.round_id)
+
+
+@dataclass
+class ReflectionOutput:
+    """Machine-readable output from the LLM-based AAVP reflector.
+
+    Used by ``Reflector._reflect_aavp`` when audio enrichments are present.
+    The Controller reads ``zoom_region`` and ``required_modalities`` to override
+    the next plan when the reflector finds insufficient multimodal alignment.
+
+    Fields:
+        sufficient:              True if evidence is enough to answer the query.
+        query_support:           Per-modality confidence scores {visual, speech, acoustic}.
+        citations:               Grounded evidence citations with timestamps and quotes.
+        contradiction_with_query: True if evidence directly contradicts the query.
+        reason_code:             One of SUFFICIENT | MODALITY_MISMATCH | TEMPORAL_GAP |
+                                 LOW_CONFIDENCE | NO_EVIDENCE.
+        zoom_region:             [t_start, t_end] for targeted re-observation (None if
+                                 not applicable).
+        required_modalities:     Escalation hints, e.g.
+                                 {"audio_enrichment": "evidence_plus_gaps",
+                                  "spatial_token_rate": "medium"}.
+        reasoning:               Human-readable explanation of the reflection decision.
+        confidence:              Reflector's confidence in its own decision (0–1).
+        query_confidence:        Estimated probability the query can be answered (0–1).
+    """
+    sufficient: bool
+    query_support: Dict[str, float] = field(default_factory=dict)
+    citations: List[Dict[str, Any]] = field(default_factory=list)
+    contradiction_with_query: bool = False
+    reason_code: str = ""
+    zoom_region: Optional[Tuple[float, float]] = None
+    required_modalities: Dict[str, str] = field(default_factory=dict)
+    reasoning: str = ""
+    confidence: float = 0.0
+    query_confidence: float = 0.0
 
 
 @dataclass
@@ -201,19 +317,42 @@ class Blackboard:
         evidence_list.sort(key=lambda ev: (get_earliest_timestamp(ev), ev.round_id))
         return evidence_list
 
+    def audio_enrichment_summary_text(self) -> str:
+        """Format all audio enrichment evidence for use in prompts.
+
+        Produces a compact timestamped block suitable for the reflector and
+        synthesis prompts.  Example output line::
+
+            t=45.0s [evidence] | Speech: "Welcome back everyone" | Acoustic: [SPEECH, MUSIC]
+            t=75.0s [gap_probe] | Speech: "" | Acoustic: [AMBIENT]
+
+        Returns empty string when no audio enrichments exist (audio_enrichment=off
+        or audio step produced no results), so callers can test truthiness.
+        """
+        lines = []
+        for ev in self.evidences:
+            for ae in ev.audio_enrichments:
+                parts = [f"t={ae.center_sec:.1f}s [{ae.source}]"]
+                if ae.speech_evidence:
+                    parts.append(f'Speech: "{ae.speech_evidence}"')
+                else:
+                    parts.append('Speech: ""')
+                if ae.acoustic_evidence:
+                    parts.append(f"Acoustic: [{', '.join(ae.acoustic_evidence)}]")
+                lines.append(" | ".join(parts))
+        return "\n".join(lines)
+
     def summary_text(self) -> str:
         """Generate a condensed text summary of all accumulated evidence.
-        
-        Returns a formatted string with evidence from each round, including:
-        - The detailed response/analysis
-        - Key evidence with timestamps and descriptions
+
+        Includes visual evidence from every round plus, when present, a
+        structured Audio Enrichment Findings block produced by the AAVP
+        post-observation step.
         """
         lines = []
         for idx, e in enumerate(self.evidences, 1):
-            # Start with the detailed response
             main_text = e.detailed_response
-            
-            # Format key evidence with descriptions
+
             evidence_lines = []
             for ev in e.key_evidence:
                 if isinstance(ev, dict):
@@ -225,18 +364,21 @@ class Blackboard:
                             evidence_lines.append(f"  • {ts_start:.1f}s - {ts_end:.1f}s: {desc}")
                         else:
                             evidence_lines.append(f"  • {ts_start:.1f}s - {ts_end:.1f}s")
-            
-            # Build the full entry
+
             entry = f"[Round {idx}] {main_text}"
             if evidence_lines:
                 entry += "\nKey observations:\n" + "\n".join(evidence_lines)
-            
+
             lines.append(entry)
-        
-        # Add query-level confidence if available
+
+        # Append audio enrichment block when any enrichments exist
+        audio_text = self.audio_enrichment_summary_text()
+        if audio_text:
+            lines.append(f"\n[Audio Enrichment Findings]\n{audio_text}")
+
         if self.query_confidence is not None:
             lines.append(f"\n[Overall Query Confidence: {self.query_confidence:.2f}]")
-        
+
         return "\n\n".join(lines)
 
 
@@ -386,6 +528,14 @@ class GeminiClient:
         self.max_frame_high = max_frame_high
         self.created_clips = []  # Track clips created during execution
         self.temp_clips_dir = None  # Will be set by Controller to be unique per job/worker
+
+        # AAVP audio config — populated by Controller from AVPConfig when present.
+        # Safe defaults mean pure-visual code paths are completely unaffected.
+        self._avp_config = None
+        self.audio_sample_rate: int = 16000
+        self.audio_max_snippets_per_round: int = 15
+        self.audio_gap_probes: int = 5
+        self.audio_closed_tags: List[str] = []
 
     def initialize_client(self):
         """Initialize the Gemini client (API key or Vertex AI)."""
@@ -642,11 +792,31 @@ class GeminiClient:
                             print(f"⚠️  Error parsing region {r}: {e}, skipping")
                         continue
             
+            # --- 5a: Parse AAVP audio fields (degrade gracefully to defaults) ---
+            audio_enrich_str = str(s.get("audio_enrichment", "off")).strip().lower()
+            try:
+                audio_enrichment = AudioEnrichmentScope(audio_enrich_str)
+            except ValueError:
+                if self.debug:
+                    print(f"⚠️  Invalid audio_enrichment: '{audio_enrich_str}', using 'off'")
+                audio_enrichment = AudioEnrichmentScope.off
+
+            audio_mode_str = str(s.get("audio_mode", "balanced")).strip().lower()
+            try:
+                audio_mode = AudioMode(audio_mode_str)
+            except ValueError:
+                if self.debug:
+                    print(f"⚠️  Invalid audio_mode: '{audio_mode_str}', using 'balanced'")
+                audio_mode = AudioMode.balanced
+
+            # --- 5b: Build WatchConfig with AAVP fields ---
             watch = WatchConfig(
                 load_mode=s["load_mode"],
                 fps=float(s["fps"]),
                 spatial_token_rate=spatial_token_rate,
-                regions=regions
+                regions=regions,
+                audio_enrichment=audio_enrichment,
+                audio_mode=audio_mode,
             )
             
             plan = PlanSpec(
@@ -667,6 +837,8 @@ class GeminiClient:
                     print(f"FPS: {plan.watch.fps}")
                     print(f"Spatial Resolution: {plan.watch.spatial_token_rate.value if hasattr(plan.watch.spatial_token_rate, 'value') else plan.watch.spatial_token_rate}")
                     print(f"Regions: {plan.watch.regions}")
+                    print(f"Audio Enrichment: {plan.watch.audio_enrichment.value}")
+                    print(f"Audio Mode: {plan.watch.audio_mode.value}")
                     print(f"Description: {plan.description}")
                     print(f"\nFull Plan JSON:")
                     print(json.dumps(dataclasses.asdict(plan), indent=2, ensure_ascii=False))
@@ -682,13 +854,18 @@ class GeminiClient:
             return self._get_fallback_plan(query)
     
     def _get_fallback_plan(self, query: str) -> PlanSpec:
-        """Fallback plan if LLM generation fails - single observation action."""
-        watch = WatchConfig(load_mode="uniform", fps=0.5, spatial_token_rate=SpatialTokenRate.low)
+        """Fallback plan if LLM generation fails — safe visual-only uniform scan."""
+        watch = WatchConfig(
+            load_mode="uniform",
+            fps=0.5,
+            spatial_token_rate=SpatialTokenRate.low,
+            audio_enrichment=AudioEnrichmentScope.off,
+        )
         return PlanSpec(
             plan_version="v1",
             query=query,
             watch=watch,
-            description="Uniform scan to gather evidence"
+            description="Uniform scan to gather evidence",
         )
 
     def infer_on_video(
@@ -1046,7 +1223,219 @@ class GeminiClient:
         )
     
     # verify_evidence method removed - Verifier now analyzes evidence without re-watching video
-    
+
+    # ------------------------------------------------------------------
+    # 7b. Audio Part helper
+    # ------------------------------------------------------------------
+
+    def _create_audio_part(self, audio_path: str) -> Part:
+        """Wrap a local WAV file as a Gemini inline-data Part.
+
+        Args:
+            audio_path: Absolute path to the extracted WAV file.
+
+        Returns:
+            A ``Part`` with ``inlineData`` blob (``audio/wav`` MIME type).
+        """
+        with open(audio_path, "rb") as fh:
+            data = fh.read()
+        return Part(inlineData=Blob(mime_type="audio/wav", data=data))
+
+    # ------------------------------------------------------------------
+    # 7a. Post-observation audio enrichment
+    # ------------------------------------------------------------------
+
+    def enrich_with_audio(
+        self,
+        evidence: "Evidence",
+        video_path: str,
+        query: str,
+        watch_cfg: "WatchConfig",
+        duration_sec: float,
+        visual_summary: str = "",
+    ) -> List["AudioEnrichment"]:
+        """Post-hoc audio enrichment on model-chosen timestamps.
+
+        Runs after the visual observation.  Extracts short WAV snippets
+        centred on the timestamps returned by the visual pass, optionally
+        adds sparse gap probes, then sends all snippets in one Gemini call
+        for structured speech/acoustic interpretation.
+
+        Steps:
+            1. Collect midpoints from ``evidence.key_evidence`` timestamps.
+            2. If scope is ``evidence_plus_gaps``, add gap probes.
+            3. Cap total snippets at ``audio_max_snippets_per_round``.
+            4. Extract WAV for each point via ``audio_utils``.
+            5. One ``generate_content`` call with all audio Parts + prompt.
+            6. Parse response against ``AUDIO_ENRICHMENT_SCHEMA``.
+            7. Cleanup temp files.
+
+        Args:
+            evidence:       Evidence from the visual observation
+                            (provides key_evidence timestamps).
+            video_path:     Path to the source video file.
+            query:          Original user query (guides relevance).
+            watch_cfg:      Watch config (audio_enrichment scope,
+                            audio_mode, snippet halfwidth).
+            duration_sec:   Total video duration in seconds.
+            visual_summary: Text summary of visual findings for
+                            cross-reference in the audio prompt.
+
+        Returns:
+            List of ``AudioEnrichment`` objects — one per snippet
+            for which the model returned a result.  Empty list on
+            complete failure.
+        """
+        if self.client is None:
+            self.initialize_client()
+
+        # ── Step 1: collect evidence midpoints ───────────────────────
+        snippet_times: List[Dict[str, Any]] = []
+        for kev in evidence.key_evidence:
+            if isinstance(kev, dict):
+                ts_start = kev.get("timestamp_start")
+                ts_end = kev.get("timestamp_end")
+                if ts_start is not None and ts_end is not None:
+                    mid = (float(ts_start) + float(ts_end)) / 2.0
+                    snippet_times.append({"center_sec": mid, "source": "evidence"})
+
+        # ── Step 2: gap probes ────────────────────────────────────────
+        if watch_cfg.audio_enrichment == AudioEnrichmentScope.evidence_plus_gaps:
+            evidence_intervals = [
+                (float(kev["timestamp_start"]), float(kev["timestamp_end"]))
+                for kev in evidence.key_evidence
+                if isinstance(kev, dict)
+                and kev.get("timestamp_start") is not None
+                and kev.get("timestamp_end") is not None
+            ]
+            max_gap_probes = getattr(self, "audio_gap_probes", 5)
+            gap_times = generate_gap_probes(
+                evidence_timestamps=evidence_intervals,
+                duration_sec=duration_sec,
+                max_probes=max_gap_probes,
+            )
+            for t in gap_times:
+                snippet_times.append({"center_sec": t, "source": "gap_probe"})
+
+        if not snippet_times:
+            if self.debug:
+                print("ℹ️  [enrich_with_audio] No timestamps to enrich — skipping audio step")
+            return []
+
+        # ── Step 3: cap total snippets (evidence first, then gaps) ───
+        max_snippets = getattr(self, "audio_max_snippets_per_round", 15)
+        if len(snippet_times) > max_snippets:
+            evidence_snips = [s for s in snippet_times if s["source"] == "evidence"]
+            gap_snips = [s for s in snippet_times if s["source"] == "gap_probe"]
+            remaining = max(0, max_snippets - len(evidence_snips))
+            snippet_times = evidence_snips + gap_snips[:remaining]
+            if self.debug:
+                print(
+                    f"ℹ️  [enrich_with_audio] Capped to {len(snippet_times)} snippets "
+                    f"({len(evidence_snips)} evidence + {len(gap_snips[:remaining])} gap probes)"
+                )
+
+        # ── Step 4: extract WAV snippets ─────────────────────────────
+        halfwidth = getattr(watch_cfg, "audio_snippet_halfwidth_sec", 2.5)
+        sample_rate = getattr(self, "audio_sample_rate", 16000)
+        temp_clips_dir = getattr(self, "temp_clips_dir", None)
+
+        audio_parts: List[Part] = []
+        temp_files: List[str] = []
+        snippet_metadata: List[Dict[str, Any]] = []
+
+        for snip in snippet_times:
+            center = snip["center_sec"]
+            start = max(0.0, center - halfwidth)
+            end = min(duration_sec, center + halfwidth)
+            audio_path = extract_audio_snippet(
+                video_path,
+                center,
+                halfwidth,
+                sample_rate=sample_rate,
+                temp_dir=temp_clips_dir,
+                debug=self.debug,
+            )
+            if audio_path:
+                audio_parts.append(self._create_audio_part(audio_path))
+                temp_files.append(audio_path)
+                snippet_metadata.append({
+                    "center_sec": center,
+                    "start_sec": start,
+                    "end_sec": end,
+                    "source": snip["source"],
+                })
+            elif self.debug:
+                print(f"⚠️  [enrich_with_audio] Failed to extract audio at t={center:.1f}s — skipping")
+
+        # ── Step 5: single Gemini call ───────────────────────────────
+        if not audio_parts:
+            cleanup_audio_artifacts(temp_files, debug=self.debug)
+            if self.debug:
+                print("⚠️  [enrich_with_audio] All WAV extractions failed — no audio enrichment")
+            return []
+
+        closed_tags: List[str] = getattr(
+            self, "audio_closed_tags",
+            [item for item in AUDIO_ENRICHMENT_SCHEMA["properties"]["audio_results"]
+             ["items"]["properties"]["acoustic_evidence"]["items"]["enum"]]
+        )
+
+        prompt = PromptManager.get_audio_enrichment_prompt(
+            query=query,
+            audio_mode=watch_cfg.audio_mode.value,
+            snippet_times=snippet_metadata,
+            visual_evidence_summary=visual_summary,
+            video_duration_sec=duration_sec,
+            closed_tags=closed_tags,
+        )
+
+        if self.debug:
+            print(
+                f"\n{'='*80}\n🔊 AUDIO ENRICHMENT — {len(audio_parts)} snippets "
+                f"({watch_cfg.audio_mode.value} mode)\n{'='*80}"
+            )
+
+        resp = self.client.models.generate_content(
+            model=self.execute_model,
+            contents=[prompt] + audio_parts,
+        )
+        response_text = getattr(resp, "text", str(resp))
+
+        # ── Step 6: parse → AudioEnrichment objects ──────────────────
+        enrichments: List[AudioEnrichment] = []
+        try:
+            data = parse_json_response(response_text)
+            if data and validate_against_schema(data, AUDIO_ENRICHMENT_SCHEMA):
+                audio_results = data.get("audio_results", [])
+                for i, ar in enumerate(audio_results):
+                    # Match back to snippet_metadata by position
+                    meta = snippet_metadata[i] if i < len(snippet_metadata) else {}
+                    center = ar.get("center_sec", meta.get("center_sec", 0.0))
+                    enrichments.append(AudioEnrichment(
+                        center_sec=float(center),
+                        window_start_sec=float(meta.get("start_sec", center - halfwidth)),
+                        window_end_sec=float(meta.get("end_sec", center + halfwidth)),
+                        speech_evidence=str(ar.get("speech_evidence", "")),
+                        acoustic_evidence=list(ar.get("acoustic_evidence", [])),
+                        source=str(meta.get("source", "evidence")),
+                    ))
+                if self.debug:
+                    print(
+                        f"✅ [enrich_with_audio] Parsed {len(enrichments)} audio enrichments. "
+                        f"Summary: {data.get('overall_audio_summary', '')[:150]}"
+                    )
+            else:
+                if self.debug:
+                    print("⚠️  [enrich_with_audio] Response failed schema validation — no enrichments stored")
+        except Exception as exc:
+            if self.debug:
+                print(f"⚠️  [enrich_with_audio] Parse error: {exc}")
+
+        # ── Step 7: cleanup ───────────────────────────────────────────
+        cleanup_audio_artifacts(temp_files, debug=self.debug)
+        return enrichments
+
     def _extract_timestamps(self, text: str) -> List[float]:
         """Extract timestamps from model response text."""
         import re
@@ -1414,7 +1803,24 @@ class Observer:
                 print(f"  ... and {len(ev.key_evidence) - 5} more")
             print(f"Reasoning: {ev.reasoning[:200]}...")
             print(f"{'='*80}\n")
-        
+
+        # === AAVP audio enrichment (post-observation, runs only when enabled) ===
+        if plan.watch.audio_enrichment != AudioEnrichmentScope.off:
+            audio_enrichments = self.client.enrich_with_audio(
+                evidence=ev,
+                video_path=bb.video_path,
+                query=plan.query,
+                watch_cfg=plan.watch,
+                duration_sec=duration,
+                visual_summary=ev.detailed_response,
+            )
+            ev.audio_enrichments = audio_enrichments
+            if self.client.debug and audio_enrichments:
+                print(
+                    f"🔊 Audio enrichment complete: {len(audio_enrichments)} snippet(s) "
+                    f"attached to evidence round {ev.round_id}"
+                )
+
         bb.add_evidence(ev)
         return ev
 
@@ -1465,12 +1871,13 @@ class Reflector:
             - confidence: float - confidence in the reflection decision
             - final_answer: Optional[Dict] - final answer data (if is_last_round=True)
         """
-        # Convert evidence list to blackboard format for compatibility and summary text
+        # Build blackboard for summary helpers
         bb = Blackboard(video_path=video_path or "")
         for ev in evidence_list:
             bb.add_evidence(ev)
         context_text = bb.summary_text()
-        
+        audio_text = bb.audio_enrichment_summary_text()
+
         # If last round, directly generate final answer using synthesis prompt
         if is_last_round:
             if self.client.debug:
@@ -1482,17 +1889,19 @@ class Reflector:
                 print(f"Video Duration: {duration_sec:.1f}s" if duration_sec else "Duration: unknown")
                 if options:
                     print(f"Options: {options}")
+                if audio_text:
+                    print(f"Audio Enrichments: {audio_text.count(chr(10)) + 1} snippet(s)")
                 print(f"{'='*80}\n")
-            
-            # Normalize options to empty list if None
+
             options_list = options if options else []
-            
-            # Generate synthesis prompt (always uses MCQ format for QA)
+
+            # Generate synthesis prompt — pass audio enrichment block when present
             prompt = PromptManager.get_synthesis_prompt(
                 original_query=query,
                 all_evidence=context_text,
                 video_duration=duration_sec or 0.0,
-                options=options_list
+                options=options_list,
+                audio_enrichment_summary=audio_text,
             )
             
             # Call LLM using plan_replan_model for final answer synthesis
@@ -1550,6 +1959,20 @@ class Reflector:
                 "final_answer": answer_data
             }
         
+        # === 8a: AAVP LLM reflection when audio enrichments are present ===
+        has_audio_evidence = any(ev.audio_enrichments for ev in evidence_list)
+        if has_audio_evidence:
+            return self._reflect_aavp(
+                query=query,
+                evidence_list=evidence_list,
+                video_path=video_path,
+                duration_sec=duration_sec,
+                options=options,
+                audio_text=audio_text,
+                context_text=context_text,
+            )
+
+        # === Legacy heuristic path (video-only evidence) ===
         if self.client.debug:
             print(f"\n{'='*80}")
             print(f"🔍 VERIFIER INPUT")
@@ -1559,7 +1982,7 @@ class Reflector:
             print(f"Video: {video_path}")
             print(f"Duration: {duration_sec:.1f}s" if duration_sec else "Duration: unknown")
             print(f"{'='*80}\n")
-        
+
         # Collect regions from current evidence
         regions: List[Tuple[float, float]] = []
         for ev in evidence_list:
@@ -1671,6 +2094,130 @@ class Reflector:
 
     # Legacy confidence/decision helpers removed in simplified loop
 
+    # ------------------------------------------------------------------
+    # 8b. LLM-based multimodal reflection (AAVP)
+    # ------------------------------------------------------------------
+
+    def _reflect_aavp(
+        self,
+        query: str,
+        evidence_list: List[Evidence],
+        video_path: str,
+        duration_sec: Optional[float],
+        options: Optional[List[str]],
+        audio_text: str,
+        context_text: str,
+    ) -> Dict[str, Any]:
+        """Query-conditioned alignment reflection using the LLM.
+
+        Called when at least one ``Evidence`` object carries audio enrichments.
+        Builds a structured reflection by calling ``get_reflection_prompt`` and
+        parsing the response against ``REFLECTION_SCHEMA``.
+
+        On parse failure, falls through transparently to the legacy heuristic
+        path so no round is lost.
+
+        Returns a dict compatible with ``Controller.run`` expectations:
+            sufficient, should_update, updates, reasoning, confidence,
+            query_confidence, event, zoom_region, reason_code,
+            required_modalities.
+        """
+        if self.client.client is None:
+            self.client.initialize_client()
+
+        if self.client.debug:
+            print(f"\n{'='*80}")
+            print(f"🎙️  AAVP REFLECTOR — LLM-based multimodal reflection")
+            print(f"{'='*80}")
+            print(f"Query: {query}")
+            print(f"Evidence rounds: {len(evidence_list)}")
+            if audio_text:
+                print(f"Audio snippets: {audio_text.count(chr(10)) + 1}")
+            print(f"{'='*80}\n")
+
+        prompt = PromptManager.get_reflection_prompt(
+            query=query,
+            evidence_summary=context_text,
+            audio_enrichment_summary=audio_text,
+            video_duration_sec=duration_sec or 0.0,
+            options=options,
+        )
+
+        resp = self.client.client.models.generate_content(
+            model=self.client.plan_replan_model,
+            contents=prompt,
+        )
+        response_text = getattr(resp, "text", str(resp))
+
+        reflection_data = parse_json_response(response_text)
+        if not (reflection_data and validate_against_schema(reflection_data, REFLECTION_SCHEMA)):
+            # ── Fallback: heuristic path ──────────────────────────────
+            if self.client.debug:
+                print("⚠️  [_reflect_aavp] Schema validation failed — falling back to heuristic")
+            # Build a minimal temporary blackboard just to reuse heuristic logic
+            bb_tmp = Blackboard(video_path=video_path or "")
+            for ev in evidence_list:
+                bb_tmp.add_evidence(ev)
+            has_evidence = any(ev.detailed_response for ev in evidence_list)
+            total_items = sum(len(ev.key_evidence) for ev in evidence_list)
+            if has_evidence and total_items >= 1:
+                query_confidence = 0.6
+            else:
+                query_confidence = 0.3
+            sufficient = query_confidence > 0.5
+            return {
+                "sufficient": sufficient,
+                "should_update": not sufficient,
+                "updates": [],
+                "reasoning": "AAVP reflection parse failed; heuristic fallback used.",
+                "confidence": 0.5,
+                "query_confidence": query_confidence,
+                "event": "AAVP_REFLECTION_FALLBACK",
+            }
+
+        # ── Parse structured reflection ───────────────────────────────
+        sufficient = bool(reflection_data.get("sufficient", False))
+        reason_code = str(reflection_data.get("reason_code", "LOW_CONFIDENCE"))
+        reasoning = str(reflection_data.get("reasoning", ""))
+        confidence = float(reflection_data.get("confidence", 0.5))
+
+        query_support = reflection_data.get("query_support", {})
+        query_confidence = float(
+            max(query_support.values()) if query_support else (0.8 if sufficient else 0.3)
+        )
+
+        zoom_region = reflection_data.get("zoom_region")
+        required_modalities = reflection_data.get("required_modalities", {})
+        citations = reflection_data.get("citations", [])
+
+        if self.client.debug:
+            print(f"\n{'='*80}")
+            print(f"✅ AAVP REFLECTOR OUTPUT")
+            print(f"{'='*80}")
+            print(f"Sufficient:       {sufficient}")
+            print(f"Reason Code:      {reason_code}")
+            print(f"Confidence:       {confidence:.2f}")
+            print(f"Query Support:    {query_support}")
+            print(f"Citations:        {len(citations)}")
+            print(f"Zoom Region:      {zoom_region}")
+            print(f"Required Mods:    {required_modalities}")
+            print(f"Reasoning:        {reasoning[:200]}...")
+            print(f"{'='*80}\n")
+
+        return {
+            "sufficient": sufficient,
+            "should_update": not sufficient,
+            "updates": [],
+            "reasoning": reasoning,
+            "confidence": confidence,
+            "query_confidence": query_confidence,
+            "event": "AAVP_REFLECTION",
+            "reason_code": reason_code,
+            "zoom_region": zoom_region,
+            "required_modalities": required_modalities,
+            "citations": citations,
+        }
+
 
 class Controller:
     """Controller orchestrates the plan-observe-reflect framework.
@@ -1700,6 +2247,18 @@ class Controller:
         if client.debug:
             print(f"📁 Using unique temp_clips directory: {self.client.temp_clips_dir}")
         self._init_meta()
+        self._propagate_audio_config()
+
+    # ---------- AAVP config propagation ----------
+    def _propagate_audio_config(self) -> None:
+        """Copy AAVP fields from client._avp_config into client runtime attrs."""
+        cfg = getattr(self.client, "_avp_config", None)
+        if cfg is None:
+            return
+        self.client.audio_sample_rate = cfg.audio_sample_rate
+        self.client.audio_max_snippets_per_round = cfg.audio_max_snippets_per_round
+        self.client.audio_gap_probes = cfg.audio_gap_probes
+        self.client.audio_closed_tags = list(cfg.audio_closed_tags)
 
     # ---------- meta ----------
     def _init_meta(self) -> None:
@@ -1890,12 +2449,43 @@ class Controller:
             if not is_last_round:
                 if self.client.debug:
                     print(f"❌ Evidence insufficient. Replanning with all evidence and history...")
-                
-                # Pass blackboard with all evidence for replanning
-                video_meta = {
-                    "duration_sec": self.bb.duration_sec,
-                }
+
+                video_meta = {"duration_sec": self.bb.duration_sec}
                 plan = self.client.plan(query, video_meta=video_meta, prior=self.bb, options=options)
+
+                # Override plan with targeted instructions from the structured reflector.
+                reflection_zoom = reflection.get("zoom_region")
+                reflection_mods = reflection.get("required_modalities") or {}
+
+                if reflection_zoom:
+                    plan.watch.load_mode = "region"
+                    plan.watch.regions = [tuple(reflection_zoom)]
+                    if self.client.debug:
+                        print(f"🔍 Reflector zoom override → region {reflection_zoom}")
+
+                if "audio_enrichment" in reflection_mods:
+                    try:
+                        plan.watch.audio_enrichment = AudioEnrichmentScope(
+                            reflection_mods["audio_enrichment"]
+                        )
+                        if self.client.debug:
+                            print(
+                                f"🔊 Reflector audio override → {plan.watch.audio_enrichment}"
+                            )
+                    except ValueError:
+                        pass
+
+                if "spatial_token_rate" in reflection_mods:
+                    try:
+                        plan.watch.spatial_token_rate = SpatialTokenRate(
+                            reflection_mods["spatial_token_rate"]
+                        )
+                        if self.client.debug:
+                            print(
+                                f"🖼  Reflector spatial rate override → {plan.watch.spatial_token_rate}"
+                            )
+                    except ValueError:
+                        pass
 
         # final answer
         if final_answer_from_reflection is not None:
@@ -1977,24 +2567,64 @@ def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _enum_val(raw: Any, default: str) -> str:
+    """Return the canonical string value of *raw*.
+
+    Works for two cases that arise in ``plan_from_dict``:
+    - In-memory round-trip via ``dataclasses.asdict``: ``raw`` is the original
+      enum instance; its ``.value`` is already the plain string we need.
+    - JSON deserialization: ``raw`` is a plain ``str`` from ``json.loads``.
+
+    Using ``str(enum_instance)`` is intentionally avoided because Python's
+    ``str(SomeStrEnum.member)`` returns ``"ClassName.member"`` on some Python
+    versions rather than just the value.
+    """
+    if raw is None:
+        return default
+    if hasattr(raw, "value"):   # enum instance
+        return str(raw.value)
+    return str(raw).strip()
+
+
 def plan_from_dict(d: Dict[str, Any]) -> PlanSpec:
     """Parse PlanSpec from dict (supports both old steps format and new watch format)."""
     # New format: watch directly in plan
     if "watch" in d:
         watch_data = d["watch"]
-        spatial_rate_str = str(watch_data["spatial_token_rate"]).strip().lower()
+
         try:
-            spatial_token_rate = SpatialTokenRate(spatial_rate_str)
+            spatial_token_rate = SpatialTokenRate(
+                _enum_val(watch_data.get("spatial_token_rate"), "low").lower()
+            )
         except ValueError:
             spatial_token_rate = SpatialTokenRate.low
-        
+
+        try:
+            audio_enrichment = AudioEnrichmentScope(
+                _enum_val(watch_data.get("audio_enrichment"), "off").lower()
+            )
+        except ValueError:
+            audio_enrichment = AudioEnrichmentScope.off
+
+        try:
+            audio_mode = AudioMode(
+                _enum_val(watch_data.get("audio_mode"), "balanced").lower()
+            )
+        except ValueError:
+            audio_mode = AudioMode.balanced
+
         watch = WatchConfig(
             load_mode=watch_data["load_mode"],
             fps=float(watch_data["fps"]),
             spatial_token_rate=spatial_token_rate,
-            regions=[(float(a), float(b)) for a, b in watch_data.get("regions", [])]
+            regions=[(float(a), float(b)) for a, b in watch_data.get("regions", [])],
+            audio_enrichment=audio_enrichment,
+            audio_mode=audio_mode,
+            audio_snippet_halfwidth_sec=float(
+                watch_data.get("audio_snippet_halfwidth_sec", 2.5)
+            ),
         )
-        
+
         return PlanSpec(
             plan_version=d.get("plan_version", "v1"),
             query=d.get("query", ""),
@@ -2004,21 +2634,25 @@ def plan_from_dict(d: Dict[str, Any]) -> PlanSpec:
             final_answer=d.get("final_answer"),
             complete=bool(d.get("complete", False)),
         )
-    
+
     # Legacy format: steps array (take first step)
     elif "steps" in d and d["steps"]:
         s = d["steps"][0]  # Take first step only
-        spatial_rate_str = str(s["watch"]["spatial_token_rate"]).strip().lower()
+        watch_data = s["watch"]
+
         try:
-            spatial_token_rate = SpatialTokenRate(spatial_rate_str)
+            spatial_token_rate = SpatialTokenRate(
+                _enum_val(watch_data.get("spatial_token_rate"), "low").lower()
+            )
         except ValueError:
             spatial_token_rate = SpatialTokenRate.low
-        
+
         watch = WatchConfig(
-            load_mode=s["watch"]["load_mode"],
-            fps=float(s["watch"]["fps"]),
+            load_mode=watch_data["load_mode"],
+            fps=float(watch_data["fps"]),
             spatial_token_rate=spatial_token_rate,
-            regions=[(float(a), float(b)) for a, b in s["watch"].get("regions", [])]
+            regions=[(float(a), float(b)) for a, b in watch_data.get("regions", [])],
+            # Legacy plans never had audio fields — AudioEnrichmentScope.off is the safe default
         )
         
         return PlanSpec(

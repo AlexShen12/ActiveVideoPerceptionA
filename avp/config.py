@@ -1,23 +1,44 @@
 """
-Lightweight configuration loader for Active Video Perception.
+Lightweight configuration loader for Active Video Perception (AVP / AAVP).
 
-Supports a single JSON file with fields like:
+Supports a single JSON file.  All fields are optional — unrecognised keys are
+ignored and every field has a safe default so existing configs continue to work
+without modification.
+
+Core fields (unchanged from AVP):
 {
-  "project": "your-gcp-project",
-  "location": ["us-central1", "us-east1", "global"],  // List of locations - randomly selected per sample
-  "model": "gemini-2.0-flash-exp",
-  "annotation_path": "/path/to/eval.json",
-  "output_dir": "/path/to/out",
-  "default_media_resolution": "medium",  // low|medium|high
-  "prefer_compressed": true,
-  "debug": false
+  "project":                  "your-gcp-project",
+  "location":                 ["us-central1", "us-east1", "global"],
+  "model":                    "gemini-2.5-pro",
+  "plan_replan_model":        "",
+  "execute_model":            "",
+  "annotation_path":          "/path/to/eval.json",
+  "output_dir":               "/path/to/out",
+  "default_media_resolution": "medium",
+  "prefer_compressed":        true,
+  "debug":                    false
 }
 
-Note: location can be a single string (converted to list) or a list of strings.
-For each sample, use config.get_random_location() to randomly select a location.
+AAVP audio enrichment fields (all default to off/disabled):
+{
+  "audio_enabled":                false,
+  "audio_sample_rate":            16000,
+  "audio_snippet_halfwidth_sec":  2.5,
+  "audio_max_snippets_per_round": 15,
+  "audio_gap_probes":             5,
+  "audio_closed_tags":            ["SILENCE", "SPEECH", ...]
+}
 
-Env overrides (if fields missing):
-- VERTEX_PROJECT, VERTEX_LOCATION, GEMINI_MODEL, GEMINI_API_KEY
+Notes:
+- location can be a single string or a list; config.get_random_location() picks
+  one randomly per sample for load-balanced Vertex AI requests.
+- audio_enabled is the master switch: when False the Observer never calls
+  audio_utils regardless of what the planner selects.
+- audio_closed_tags must stay in sync with the enum list in prompt.py
+  (_ACOUSTIC_TAGS) and AUDIO_ENRICHMENT_SCHEMA.
+
+Env overrides (applied after JSON, if set):
+  VERTEX_PROJECT, VERTEX_LOCATION, GEMINI_MODEL, GEMINI_API_KEY
 """
 
 from __future__ import annotations
@@ -48,6 +69,41 @@ class AVPConfig:
     max_frame_low: int = 512
     max_frame_medium: int = 128
     max_frame_high: int = 128
+
+    # ------------------------------------------------------------------
+    # AAVP audio enrichment settings
+    # All default to off / conservative values so existing AVP configs
+    # are completely unaffected.
+    # ------------------------------------------------------------------
+
+    # Master switch.  When False the Observer skips audio enrichment entirely,
+    # even if the planner sets audio_enrichment != "off".
+    audio_enabled: bool = False
+
+    # PCM sample rate for ffmpeg WAV extraction.  16 000 Hz is the Gemini
+    # minimum and produces ~64 KB per 5 s snippet.
+    audio_sample_rate: int = 16000
+
+    # Half-width of each audio window in seconds (total window = 2 × this).
+    # 2.5 s → 5 s window, centred on the key_evidence midpoint.
+    audio_snippet_halfwidth_sec: float = 2.5
+
+    # Maximum WAV snippets sent in a single enrichment API call per round.
+    # Evidence-source snippets are always kept; gap probes are trimmed first
+    # when the cap is exceeded.
+    audio_max_snippets_per_round: int = 15
+
+    # Maximum number of gap probes added when audio_enrichment="evidence_plus_gaps".
+    audio_gap_probes: int = 5
+
+    # Closed-vocabulary acoustic event tags.  Must stay in sync with
+    # prompt._ACOUSTIC_TAGS and AUDIO_ENRICHMENT_SCHEMA.
+    audio_closed_tags: List[str] = field(default_factory=lambda: [
+        "SILENCE", "SPEECH", "MUSIC", "CHEER", "APPLAUSE",
+        "WHISTLE", "BUZZER", "CRASH", "DOOR", "FOOTSTEPS",
+        "ENGINE", "SIREN", "BELL", "TYPING", "LAUGHTER",
+        "ANIMAL", "WATER", "WIND", "AMBIENT", "OTHER",
+    ])
 
     def __post_init__(self):
         """Initialize location as list if it's a string."""

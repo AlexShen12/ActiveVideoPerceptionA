@@ -7,6 +7,7 @@ A multi-step video analysis framework using Gemini API with:
 - Coarse-to-fine progressive exploration
 - Structured JSON outputs with validation
 - Centralized prompt management
+- Post-hoc audio enrichment (AAVP)
 """
 
 from .main import (
@@ -16,7 +17,13 @@ from .main import (
     Blackboard,
     WatchConfig,
     SpatialTokenRate,
-    
+
+    # AAVP data structures
+    AudioEnrichmentScope,
+    AudioMode,
+    AudioEnrichment,
+    ReflectionOutput,
+
     # Core components
     GeminiClient,
     Planner,
@@ -24,7 +31,7 @@ from .main import (
     Reflector,
     Controller,
     VideoMetadataExtractor,
-    
+
     # Storage
     Store,
 )
@@ -36,6 +43,10 @@ from .prompt import (
     PLAN_SCHEMA,
     EVIDENCE_SCHEMA,
     FINAL_ANSWER_SCHEMA,
+
+    # AAVP schemas
+    AUDIO_ENRICHMENT_SCHEMA,
+    REFLECTION_SCHEMA,
 )
 
 from .video_utils import (
@@ -52,6 +63,14 @@ from .video_utils import (
     load_video_metadata_from_json,
 )
 
+from .audio_utils import (
+    check_ffmpeg_audio_support,
+    extract_audio_snippet,
+    extract_audio_region,
+    generate_gap_probes,
+    cleanup_audio_artifacts,
+)
+
 from .config import (
     AVPConfig,
     load_config,
@@ -65,7 +84,13 @@ __all__ = [
     "Blackboard",
     "WatchConfig",
     "SpatialTokenRate",
-    
+
+    # AAVP data structures
+    "AudioEnrichmentScope",
+    "AudioMode",
+    "AudioEnrichment",
+    "ReflectionOutput",
+
     # Core components
     "GeminiClient",
     "Planner",
@@ -73,7 +98,7 @@ __all__ = [
     "Reflector",
     "Controller",
     "Store",
-    
+
     # Video utilities
     "VideoMetadataExtractor",
     "sha256_file",
@@ -86,7 +111,14 @@ __all__ = [
     "format_duration",
     "set_metadata_source",
     "load_video_metadata_from_json",
-    
+
+    # Audio utilities (AAVP)
+    "check_ffmpeg_audio_support",
+    "extract_audio_snippet",
+    "extract_audio_region",
+    "generate_gap_probes",
+    "cleanup_audio_artifacts",
+
     # Prompt management
     "PromptManager",
     "parse_json_response",
@@ -94,9 +126,10 @@ __all__ = [
     "PLAN_SCHEMA",
     "EVIDENCE_SCHEMA",
     "FINAL_ANSWER_SCHEMA",
-    
+    "AUDIO_ENRICHMENT_SCHEMA",
+    "REFLECTION_SCHEMA",
+
     # Configuration
     "AVPConfig",
     "load_config",
 ]
-
