@@ -157,8 +157,12 @@ def evaluate_dataset(
         print(f"Question: {question[:100]}...")
         if options:
             print(f"MCQ with {len(options)} options")
-        if sample.get("duration"):
-            print(f"Duration: {sample.get('duration'):.1f}s")
+        _dur = sample.get("duration")
+        if _dur is not None:
+            try:
+                print(f"Duration: {float(_dur):.1f}s")
+            except (TypeError, ValueError):
+                print(f"Duration: {_dur}")
         
         # Randomly select location for this sample
         sample_location = cfg.get_random_location()
@@ -204,6 +208,9 @@ def evaluate_dataset(
                     max_frame_high=cfg.max_frame_high,
                     debug=cfg.debug,
                 )
+                # Propagate AAVP audio config so Controller._propagate_audio_config
+                # and the Observer audio_enabled gate work correctly.
+                client._avp_config = cfg
                 client.initialize_client()
                 
                 # Initialize Controller (save in all_sample subfolder)

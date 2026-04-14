@@ -1805,7 +1805,12 @@ class Observer:
             print(f"{'='*80}\n")
 
         # === AAVP audio enrichment (post-observation, runs only when enabled) ===
-        if plan.watch.audio_enrichment != AudioEnrichmentScope.off:
+        # Respect the audio_enabled master switch when an AVPConfig is attached.
+        # If no config is present (legacy / unit-test paths) fall through to the
+        # planner-decided audio_enrichment scope as before.
+        _avp_cfg = getattr(self.client, "_avp_config", None)
+        _audio_globally_enabled = (_avp_cfg is None) or bool(_avp_cfg.audio_enabled)
+        if _audio_globally_enabled and plan.watch.audio_enrichment != AudioEnrichmentScope.off:
             audio_enrichments = self.client.enrich_with_audio(
                 evidence=ev,
                 video_path=bb.video_path,
