@@ -99,6 +99,17 @@ def main() -> None:
         metavar="REF_JSON",
         help="Optional: path to bundled eval_videomme.json to add numeric durations",
     )
+    ap.add_argument(
+        "--max-videos",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Only include questions for the first N unique videos "
+            "(e.g. --max-videos 100 → ~300 rows for VideoMME's 3 questions/video). "
+            "Videos are taken in the order they appear in the parquet."
+        ),
+    )
     args = ap.parse_args()
 
     # ── imports ──────────────────────────────────────────────────────────────
@@ -130,6 +141,13 @@ def main() -> None:
     missing_cols = required - set(df.columns)
     if missing_cols:
         sys.exit(f"Missing required columns in parquet: {missing_cols}")
+
+    # ── optionally restrict to first N unique videos ──────────────────────────
+    if args.max_videos is not None and args.max_videos > 0:
+        unique_vids = list(dict.fromkeys(str(r) for r in df["video_id"]))
+        keep = set(unique_vids[: args.max_videos])
+        df = df[df["video_id"].astype(str).isin(keep)].reset_index(drop=True)
+        print(f"Filtered to first {args.max_videos} videos → {len(df)} rows")
 
     # ── build records ─────────────────────────────────────────────────────────
     records = []

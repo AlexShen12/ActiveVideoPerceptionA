@@ -87,7 +87,8 @@ def run_worker(
     config_path: Optional[str],
     max_turns: int,
     limit: Optional[int],
-    timeout: Optional[int] = None
+    timeout: Optional[int] = None,
+    sleep_between_samples: int = 0,
 ) -> Dict[str, Any]:
     """Run evaluation for a single chunk.
     
@@ -99,6 +100,7 @@ def run_worker(
         max_turns: Max plan-execute cycles
         limit: Optional limit on samples
         timeout: Timeout per sample in seconds
+        sleep_between_samples: Seconds to sleep between samples (rate limiting)
         
     Returns:
         Worker result dict
@@ -126,11 +128,16 @@ def run_worker(
     
     if timeout:
         cmd.extend(["--timeout", str(timeout)])
+
+    if sleep_between_samples > 0:
+        cmd.extend(["--sleep-between-samples", str(sleep_between_samples)])
     
     logger.info(f"Worker {worker_id}: Starting evaluation of {chunk_file}")
     logger.info(f"Worker {worker_id}: Log file: {log_file}")
     if timeout:
         logger.info(f"Worker {worker_id}: Timeout per sample: {timeout}s")
+    if sleep_between_samples > 0:
+        logger.info(f"Worker {worker_id}: Sleep between samples: {sleep_between_samples}s")
     
     start_time = time.time()
     
@@ -278,7 +285,8 @@ def run_parallel_evaluation(
     num_workers: int,
     max_turns: int,
     limit: Optional[int],
-    timeout: Optional[int] = None
+    timeout: Optional[int] = None,
+    sleep_between_samples: int = 0,
 ) -> Dict[str, Any]:
     """Run parallel evaluation with N workers.
     
@@ -290,6 +298,7 @@ def run_parallel_evaluation(
         max_turns: Max plan-execute cycles
         limit: Optional limit on samples
         timeout: Timeout per sample in seconds
+        sleep_between_samples: Seconds to sleep between samples per worker
         
     Returns:
         Final summary dict
@@ -300,6 +309,8 @@ def run_parallel_evaluation(
     logger.info(f"Starting parallel evaluation with {num_workers} workers")
     logger.info(f"Annotation file: {ann_path}")
     logger.info(f"Output directory: {output_dir}")
+    if sleep_between_samples > 0:
+        logger.info(f"Sleep between samples: {sleep_between_samples}s")
     
     # Split annotations
     chunk_files = split_annotations(ann_path, num_workers, output_path)
@@ -319,7 +330,8 @@ def run_parallel_evaluation(
                 config_path=config_path,
                 max_turns=max_turns,
                 limit=limit,
-                timeout=timeout
+                timeout=timeout,
+                sleep_between_samples=sleep_between_samples,
             )
             futures.append(future)
         
@@ -369,6 +381,8 @@ def main():
     parser.add_argument("--limit", type=int, default=None, help="Limit total samples (for testing)")
     parser.add_argument("--num-workers", type=int, default=4, help="Number of parallel workers")
     parser.add_argument("--timeout", type=int, default=None, help="Timeout per sample in seconds")
+    parser.add_argument("--sleep-between-samples", type=int, default=0,
+                        help="Seconds to sleep between samples within each worker (rate limiting)")
     
     args = parser.parse_args()
     
@@ -383,7 +397,8 @@ def main():
         num_workers=args.num_workers,
         max_turns=args.max_turns,
         limit=args.limit,
-        timeout=args.timeout
+        timeout=args.timeout,
+        sleep_between_samples=args.sleep_between_samples,
     )
     
     if summary.get("success") is not False:

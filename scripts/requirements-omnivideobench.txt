@@ -1,0 +1,7 @@
+# Extra dependencies for downloading and processing OmniVideoBench from HuggingFace.
+# Install with: pip install -r scripts/requirements-omnivideobench.txt
+huggingface_hub>=0.22.0
+hf_transfer>=0.1.6   # optional: speeds up downloads
+datasets>=2.18.0
+pandas>=1.5.0
+pyarrow>=12.0.0

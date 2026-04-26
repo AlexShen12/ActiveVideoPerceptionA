@@ -60,6 +60,13 @@ OUT_DIR="${OUT_DIR:-${REPO_ROOT}/avp/out_videomme_aavp}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 MAX_TURNS="${MAX_TURNS:-3}"
 TIMEOUT="${TIMEOUT:-2000}"   # seconds per sample (audio adds ffmpeg + extra API call)
+# Seconds to sleep between samples within each worker (reduces API call rate).
+SLEEP_BETWEEN_SAMPLES="${SLEEP_BETWEEN_SAMPLES:-0}"
+
+# ── Optional: limit evaluation to first N unique videos ──────────────────────
+# Set MAX_VIDEOS=100 to run a 100-video pilot (≈300 questions for VideoMME).
+# Leave unset or 0 to evaluate the full dataset.
+MAX_VIDEOS="${MAX_VIDEOS:-0}"
 
 # ── Optional: reference annotation for numeric durations ─────────────────────
 MERGE_DURATION_ARG=""
@@ -81,6 +88,7 @@ echo "  OUT_DIR     : ${OUT_DIR}"
 echo "  NUM_WORKERS : ${NUM_WORKERS}"
 echo "  MAX_TURNS   : ${MAX_TURNS}"
 echo "  TIMEOUT     : ${TIMEOUT}s"
+echo "  MAX_VIDEOS  : ${MAX_VIDEOS:-all}"
 echo "=========================================="
 
 # ── Guard: video root must exist ─────────────────────────────────────────────
@@ -101,24 +109,37 @@ fi
 # ── Step 1: Build eval JSON ───────────────────────────────────────────────────
 echo ""
 echo "── Step 1: Building eval JSON from parquet ──"
+
+MAX_VIDEOS_ARG=""
+if [[ "${MAX_VIDEOS:-0}" -gt 0 ]]; then
+    MAX_VIDEOS_ARG="--max-videos ${MAX_VIDEOS}"
+fi
+
 python scripts/build_videomme_eval_json.py \
     --parquet  "${PARQUET_FILE}" \
     --video-root "${VIDEO_ROOT}" \
     --output   "${ANN_OUT}" \
-    ${MERGE_DURATION_ARG}
+    ${MERGE_DURATION_ARG} \
+    ${MAX_VIDEOS_ARG}
 
 echo "Annotation JSON ready: ${ANN_OUT}"
 
 # ── Step 2: Run parallel evaluation ──────────────────────────────────────────
 echo ""
 echo "── Step 2: Running avp.eval_parallel ──"
+SLEEP_ARG=""
+if [[ "${SLEEP_BETWEEN_SAMPLES:-0}" -gt 0 ]]; then
+    SLEEP_ARG="--sleep-between-samples ${SLEEP_BETWEEN_SAMPLES}"
+fi
+
 python -m avp.eval_parallel \
     --ann         "${ANN_OUT}" \
     --out         "${OUT_DIR}" \
     --config      "${CONFIG_FILE}" \
     --max-turns   "${MAX_TURNS}" \
     --num-workers "${NUM_WORKERS}" \
-    --timeout     "${TIMEOUT}"
+    --timeout     "${TIMEOUT}" \
+    ${SLEEP_ARG}
 
 echo ""
 echo "=========================================="

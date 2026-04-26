@@ -105,6 +105,46 @@ except Exception:
 # Max frame settings moved to config - use AVPConfig.max_frame_* instead
 
 
+# ======================================================
+# API retry helper
+# ======================================================
+
+def _generate_with_backoff(models_client, *, model: str, contents, config=None, max_retries: int = 6):
+    """Call ``models_client.generate_content`` with exponential back-off.
+
+    Retries on HTTP 429 (quota / rate-limit) and transient 5xx errors.
+    Raises the last exception if all retries are exhausted.
+
+    Delay schedule (seconds): 5, 10, 20, 40, 80, 160  (doubles each time, cap 160 s).
+    """
+    delay = 5.0
+    for attempt in range(max_retries + 1):
+        try:
+            if config is not None:
+                return models_client.generate_content(
+                    model=model, contents=contents, config=config
+                )
+            return models_client.generate_content(model=model, contents=contents)
+        except Exception as exc:
+            msg = str(exc)
+            # Retry on quota / rate-limit errors and transient server errors.
+            is_retryable = (
+                "429" in msg
+                or "RESOURCE_EXHAUSTED" in msg
+                or "quota" in msg.lower()
+                or "rate" in msg.lower()
+                or "503" in msg
+                or "500" in msg
+            )
+            if not is_retryable or attempt == max_retries:
+                raise
+            wait = min(delay, 160.0)
+            print(
+                f"[retry] generate_content hit retryable error (attempt {attempt + 1}/{max_retries}): "
+                f"{msg[:120]} — waiting {wait:.0f}s"
+            )
+            time.sleep(wait)
+            delay *= 2
 
 
 # ======================================================
@@ -723,9 +763,10 @@ class GeminiClient:
             print(f"{'='*80}\n")
         
         # Call LLM using plan_replan_model for planning
-        resp = self.client.models.generate_content(
-            model=self.plan_replan_model, 
-            contents=prompt
+        resp = _generate_with_backoff(
+            self.client.models,
+            model=self.plan_replan_model,
+            contents=prompt,
         )
         response_text = getattr(resp, "text", str(resp))
         
@@ -1107,17 +1148,12 @@ class GeminiClient:
         
         # Call Gemini API with all video parts (multiple clips or single video)
         contents = [prompt] + parts
-        if generate_content_config:
-            resp = self.client.models.generate_content(
-                model=self.execute_model, 
-                contents=contents,
-                config=generate_content_config
-            )
-        else:
-            resp = self.client.models.generate_content(
-                model=self.execute_model, 
-                contents=contents
-            )
+        resp = _generate_with_backoff(
+            self.client.models,
+            model=self.execute_model,
+            contents=contents,
+            config=generate_content_config,
+        )
         response_text = getattr(resp, "text", str(resp))
         
         # Try to parse structured JSON response
@@ -1396,7 +1432,8 @@ class GeminiClient:
                 f"({watch_cfg.audio_mode.value} mode)\n{'='*80}"
             )
 
-        resp = self.client.models.generate_content(
+        resp = _generate_with_backoff(
+            self.client.models,
             model=self.execute_model,
             contents=[prompt] + audio_parts,
         )
@@ -1601,9 +1638,10 @@ class GeminiClient:
                 print(f"📝 MCQ format (open-ended question)")
         
         # Call LLM using plan_replan_model for final answer synthesis (reasoning task)
-        resp = self.client.models.generate_content(
-            model=self.plan_replan_model, 
-            contents=prompt
+        resp = _generate_with_backoff(
+            self.client.models,
+            model=self.plan_replan_model,
+            contents=prompt,
         )
         response_text = getattr(resp, "text", str(resp))
         
@@ -1913,9 +1951,10 @@ class Reflector:
             if self.client.client is None:
                 self.client.initialize_client()
             
-            resp = self.client.client.models.generate_content(
+            resp = _generate_with_backoff(
+                self.client.client.models,
                 model=self.client.plan_replan_model,
-                contents=prompt
+                contents=prompt,
             )
             response_text = getattr(resp, "text", str(resp))
             
@@ -2148,7 +2187,8 @@ class Reflector:
             options=options,
         )
 
-        resp = self.client.client.models.generate_content(
+        resp = _generate_with_backoff(
+            self.client.client.models,
             model=self.client.plan_replan_model,
             contents=prompt,
         )

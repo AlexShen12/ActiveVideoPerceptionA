@@ -99,6 +99,7 @@ def evaluate_dataset(
     limit: int | None = None,
     max_turns: int = 3,
     timeout_per_sample: int | None = None,
+    sleep_between_samples: int = 0,
 ) -> Dict[str, Any]:
     """Run full agentic evaluation on video QA dataset.
     
@@ -109,6 +110,7 @@ def evaluate_dataset(
         limit: Optional limit on number of samples
         max_turns: Max plan-execute cycles per sample
         timeout_per_sample: Timeout per sample in seconds (None = no timeout)
+        sleep_between_samples: Seconds to sleep between samples (rate limiting)
         
     Returns:
         Summary dict with accuracy and stats
@@ -308,6 +310,11 @@ def evaluate_dataset(
 
             # Clean up video clips after sample evaluation (only clips created during this sample)
             cleanup_video_clips(clip_paths=controller.client.created_clips, debug=True)
+
+            # Rate limiting: pause between samples to stay within API quota
+            if sleep_between_samples > 0 and idx < len(samples) - 1:
+                print(f"Sleeping {sleep_between_samples}s before next sample...")
+                time.sleep(sleep_between_samples)
             
         except TimeoutError as e:
             print(f"TIMEOUT on sample {idx}: {e}")
@@ -393,9 +400,13 @@ def main():
     ap.add_argument("--limit", type=int, default=None, help="Evaluate first N samples")
     ap.add_argument("--max-turns", type=int, default=3, help="Max plan-execute cycles per sample")
     ap.add_argument("--timeout", type=int, default=None, help="Timeout per sample in seconds")
+    ap.add_argument("--sleep-between-samples", type=int, default=0,
+                    help="Seconds to sleep between samples (rate limiting)")
     args = ap.parse_args()
     
-    out = evaluate_dataset(args.ann, args.out, args.config, args.limit, args.max_turns, timeout_per_sample=args.timeout)
+    out = evaluate_dataset(args.ann, args.out, args.config, args.limit, args.max_turns,
+                           timeout_per_sample=args.timeout,
+                           sleep_between_samples=args.sleep_between_samples)
     return out
 
 
