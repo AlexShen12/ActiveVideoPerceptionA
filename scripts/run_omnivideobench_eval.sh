@@ -16,9 +16,10 @@
 #   export ENV_FILE=/path/to/custom.env
 #
 # Audio note:
-#   OmniVideoBench is designed to require both audio and visual reasoning.
-#   Set audio_enabled: true in avp/config.json (see avp/config.aavp.json for a
-#   template) so the AAVP Observer actually processes the audio track.
+#   OmniVideoBench requires audio-visual reasoning.  This script defaults
+#   CONFIG_FILE to avp/config.aavp.json (audio_enabled: true).  Override with:
+#     export CONFIG_FILE=/path/to/your/config.json  (must set audio_enabled: true).
+#   The script verifies audio_enabled unless VERIFY_OMNI_AUDIO=0.
 #
 # The script:
 #   1. Builds eval_omnivideo_with_paths.json from the annotation + video root.
@@ -65,8 +66,11 @@ fi
 # ── Output JSON (built in step 1) ────────────────────────────────────────────
 ANN_OUT="${ANN_OUT:-${REPO_ROOT}/eval_omnivideo_with_paths.json}"
 
-# ── Config file (must have audio_enabled: true) ───────────────────────────────
-CONFIG_FILE="${CONFIG_FILE:-${REPO_ROOT}/avp/config.json}"
+# ── Config file (OmniVideoBench defaults to AAVP template = audio ON) ───────────
+# Default avoids silent visual-only runs (audio_enabled: false is common in
+# a hand-edited config.json).  Merge credentials into config.aavp.json or pass
+# CONFIG_FILE explicitly if you maintain a separate JSON.
+CONFIG_FILE="${CONFIG_FILE:-${REPO_ROOT}/avp/config.aavp.json}"
 
 # ── Eval output directory ─────────────────────────────────────────────────────
 OUT_DIR="${OUT_DIR:-${REPO_ROOT}/avp/out_omnivideo_aavp}"
@@ -115,12 +119,36 @@ if [[ ! -d "${OMNIVIDEO_VIDEO_ROOT}" ]]; then
     exit 1
 fi
 
-# ── Guard: config must exist and note about audio ────────────────────────────
+# ── Guard: config must exist ─────────────────────────────────────────────────
 if [[ ! -f "${CONFIG_FILE}" ]]; then
     echo "ERROR: CONFIG_FILE not found: ${CONFIG_FILE}" >&2
-    echo "  Copy avp/config.aavp.json to avp/config.json and set your credentials." >&2
-    echo "  Ensure audio_enabled: true is set for the audio-visual pipeline." >&2
+    echo "  Defaults to avp/config.aavp.json (audio_enabled: true)." >&2
+    echo "  Copy template and merge credentials: cp avp/config.aavp.json avp/my_omni.json && edit" >&2
     exit 1
+fi
+
+# ── Require audio_enabled=true (unless explicitly skipped for debugging) ─────
+VERIFY_OMNI_AUDIO="${VERIFY_OMNI_AUDIO:-1}"
+if [[ "${VERIFY_OMNI_AUDIO}" != "0" ]]; then
+    python <<PY
+import json, sys
+path = """${CONFIG_FILE}"""
+try:
+    with open(path, encoding="utf-8") as f:
+        d = json.load(f)
+except Exception as e:
+    print(f"ERROR: cannot parse JSON config {path}: {e}", file=sys.stderr)
+    sys.exit(1)
+if not bool(d.get("audio_enabled")):
+    print(
+        "ERROR: OmniVideoBench requires audio_enabled: true.",
+        file=sys.stderr,
+    )
+    print(f"       In {path!r}, audio_enabled is {d.get('audio_enabled')!r}.", file=sys.stderr)
+    print("       Merge avp/config.aavp.json (audio on) into your CONFIG_FILE,", file=sys.stderr)
+    print("       or unset audio_enabled:false.  Bypass (not recommended): VERIFY_OMNI_AUDIO=0", file=sys.stderr)
+    sys.exit(1)
+PY
 fi
 
 # ── Step 1: Build eval JSON ───────────────────────────────────────────────────
