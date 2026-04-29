@@ -123,7 +123,16 @@ from avp.prompt import (  # noqa: E402
     PLAN_SCHEMA,
     REFLECTION_SCHEMA,
     validate_against_schema,
+    PromptManager,
 )
+from avp.timbre_anchor_cache import (  # noqa: E402
+    TimbreAnchor,
+    filter_anchors_in_regions,
+    load_cache as load_timbre_cache,
+    save_cache as save_timbre_cache,
+)
+from avp import timbre_anchor_cache as _tac  # noqa: E402
+from avp import main as _avp_main  # noqa: E402
 
 
 # ===========================================================================
@@ -630,12 +639,16 @@ class TestBlackboardAudioSummaryText:
         ae = _make_audio_enrichment(10.0, speech="Key statement")
         bb = self._bb_with_enrichments([[ae]])
         full = bb.summary_text()
-        assert 'Audio Enrichment' in full
+        # AAVP2 renames the section to "Regional Speech Transcripts" to
+        # reflect the local-Whisper pipeline; legacy "Audio Enrichment"
+        # naming is gone.
+        assert 'Regional Speech Transcripts' in full
         assert 'Key statement' in full
 
     def test_summary_text_no_audio_section_when_empty(self):
         bb = self._bb_with_enrichments([[]])
         full = bb.summary_text()
+        assert 'Regional Speech Transcripts' not in full
         assert 'Audio Enrichment' not in full
 
 
@@ -731,6 +744,7 @@ class TestBackwardsCompatibility:
         bb.add_evidence(ev)
         text = bb.summary_text()
         assert "Audio Enrichment" not in text
+        assert "Regional Speech Transcripts" not in text
 
     def test_audio_enrichment_scope_is_str_enum(self):
         """AudioEnrichmentScope inherits from str for JSON-safe serialisation."""
@@ -743,7 +757,291 @@ class TestBackwardsCompatibility:
 
 
 # ===========================================================================
-# 10. Integration test stubs (require API + real video)
+# 10. AAVP2 — timbre anchor cache + filter
+# ===========================================================================
+
+
+class TestFilterAnchorsInRegions:
+    """``filter_anchors_in_regions`` keeps anchors whose centre is in any region."""
+
+    def _anchor(self, c: float) -> TimbreAnchor:
+        return TimbreAnchor(center_sec=c, window_start_sec=c - 2.5, window_end_sec=c + 2.5, transcript="t")
+
+    def test_empty_inputs_return_empty(self):
+        assert filter_anchors_in_regions([], [(0.0, 10.0)]) == []
+        assert filter_anchors_in_regions([self._anchor(5.0)], []) == []
+
+    def test_keeps_centres_inside_single_region(self):
+        anchors = [self._anchor(2.0), self._anchor(15.0), self._anchor(25.0)]
+        out = filter_anchors_in_regions(anchors, [(10.0, 20.0)])
+        assert [a.center_sec for a in out] == [15.0]
+
+    def test_keeps_centres_across_multiple_regions(self):
+        anchors = [self._anchor(5.0), self._anchor(35.0), self._anchor(80.0)]
+        out = filter_anchors_in_regions(anchors, [(0.0, 10.0), (75.0, 90.0)])
+        assert sorted(a.center_sec for a in out) == [5.0, 80.0]
+
+    def test_inverted_regions_skipped(self):
+        anchors = [self._anchor(5.0)]
+        out = filter_anchors_in_regions(anchors, [(20.0, 10.0)])
+        assert out == []
+
+    def test_accepts_list_of_lists(self):
+        anchors = [self._anchor(5.0)]
+        out = filter_anchors_in_regions(anchors, [[0.0, 10.0]])
+        assert [a.center_sec for a in out] == [5.0]
+
+
+class TestTimbreCacheRoundTrip:
+    """``save_cache`` then ``load_cache`` returns the same anchors."""
+
+    def _params(self):
+        return dict(anchor_interval_sec=15.0, timbre_window_sec=5.0, whisper_model="base")
+
+    def test_save_then_load(self, tmp_path):
+        video = tmp_path / "vid.mp4"
+        video.write_bytes(b"\x00" * 32)
+        anchors = [
+            TimbreAnchor(center_sec=10.0, window_start_sec=7.5, window_end_sec=12.5, transcript="hello"),
+            TimbreAnchor(center_sec=30.0, window_start_sec=27.5, window_end_sec=32.5, transcript=""),
+        ]
+        save_timbre_cache(str(tmp_path / "cache"), str(video), anchors, **self._params())
+        loaded = load_timbre_cache(str(tmp_path / "cache"), str(video), **self._params())
+        assert loaded is not None
+        assert [a.center_sec for a in loaded] == [10.0, 30.0]
+        assert loaded[0].transcript == "hello"
+        assert loaded[1].transcript == ""
+
+    def test_load_miss_returns_none(self, tmp_path):
+        video = tmp_path / "vid.mp4"
+        video.write_bytes(b"\x00" * 32)
+        loaded = load_timbre_cache(str(tmp_path / "cache"), str(video), **self._params())
+        assert loaded is None
+
+    def test_param_change_invalidates_cache(self, tmp_path):
+        video = tmp_path / "vid.mp4"
+        video.write_bytes(b"\x00" * 32)
+        anchors = [TimbreAnchor(10.0, 7.5, 12.5, "x")]
+        save_timbre_cache(str(tmp_path / "cache"), str(video), anchors, **self._params())
+        # Changing whisper_model changes the cache key — old entry is hidden.
+        miss = load_timbre_cache(
+            str(tmp_path / "cache"),
+            str(video),
+            anchor_interval_sec=15.0,
+            timbre_window_sec=5.0,
+            whisper_model="large-v3",
+        )
+        assert miss is None
+
+    def test_empty_cache_dir_returns_none(self, tmp_path):
+        video = tmp_path / "vid.mp4"
+        video.write_bytes(b"\x00" * 32)
+        loaded = load_timbre_cache("", str(video), **self._params())
+        assert loaded is None
+
+
+class TestPreplanAnchorsCacheHit:
+    """``preplan_anchors`` reuses cached entries without rerunning librosa/Whisper."""
+
+    def test_cache_hit_skips_compute(self, tmp_path, monkeypatch):
+        video = tmp_path / "vid.mp4"
+        video.write_bytes(b"\x00" * 32)
+        cache_dir = tmp_path / "cache"
+        prebaked = [
+            TimbreAnchor(center_sec=10.0, window_start_sec=7.5, window_end_sec=12.5, transcript="hi"),
+        ]
+        save_timbre_cache(
+            str(cache_dir),
+            str(video),
+            prebaked,
+            anchor_interval_sec=15.0,
+            timbre_window_sec=5.0,
+            whisper_model="base",
+        )
+
+        # Sentinel: any call to compute_timbre_boundaries / transcribe_wav
+        # would be a duplicate and must not happen on a cache hit.
+        compute_calls = []
+        transcribe_calls = []
+        monkeypatch.setattr(
+            _tac,
+            "compute_timbre_boundaries",
+            lambda *a, **k: compute_calls.append(1) or [],
+        )
+        monkeypatch.setattr(
+            _tac,
+            "transcribe_wav",
+            lambda *a, **k: transcribe_calls.append(1) or "",
+        )
+
+        out = _tac.preplan_anchors(
+            str(video),
+            duration_sec=30.0,
+            cache_dir=str(cache_dir),
+            anchor_interval_sec=15.0,
+            timbre_window_sec=5.0,
+            whisper_model="base",
+        )
+        assert [a.center_sec for a in out] == [10.0]
+        assert out[0].transcript == "hi"
+        assert compute_calls == []
+        assert transcribe_calls == []
+
+
+# ===========================================================================
+# 11. Observer load_mode branching (uniform no-op, region attaches cached ASR)
+# ===========================================================================
+
+
+class _StubClient:
+    """Minimal stand-in for GeminiClient so Observer.observe is exercisable.
+
+    Bypasses the genai SDK entirely.  ``infer_on_video`` returns a fixed
+    ``Evidence`` so we can probe the post-observation audio branch.
+    """
+    def __init__(self, audio_enabled: bool = True):
+        self.debug = False
+        self.temp_clips_dir = None
+        self.created_clips = []
+        self._avp_config = AVPConfig(audio_enabled=audio_enabled)
+        self.audio_sample_rate = 16000
+        self.audio_max_snippets_per_round = 15
+        self.audio_gap_probes = 5
+        self.audio_closed_tags = []
+
+    def infer_on_video(self, **_):
+        return Evidence(
+            detailed_response="visual",
+            key_evidence=[{"timestamp_start": 30.0, "timestamp_end": 35.0, "description": "moment"}],
+            reasoning="r",
+        )
+
+    # Ensure the legacy enrichment path raises if accidentally called — that
+    # would mean we regressed back to the Gemini WAV transcription pipeline.
+    def enrich_with_audio(self, *a, **k):
+        raise AssertionError("enrich_with_audio must not be called under AAVP2")
+
+
+class _StubMetaExtractor:
+    def __init__(self, *a, **k):
+        self.duration = 120.0
+
+
+@pytest.fixture
+def _patch_meta_extractor(monkeypatch):
+    monkeypatch.setattr(_avp_main, "VideoMetadataExtractor", _StubMetaExtractor)
+
+
+class TestObserverAudioBranch:
+    def _bb_with_anchors(self, anchors_meta):
+        bb = Blackboard(video_path="/fake/video.mp4", duration_sec=120.0)
+        bb.meta["preplan_timbre_anchors"] = anchors_meta
+        return bb
+
+    def _plan(self, *, load_mode: str, regions=None) -> PlanSpec:
+        return PlanSpec(
+            plan_version="v2",
+            query="What does the narrator say?",
+            watch=WatchConfig(
+                load_mode=load_mode,
+                fps=1.0,
+                spatial_token_rate=SpatialTokenRate.low,
+                regions=regions or [],
+            ),
+            description="test",
+        )
+
+    def test_uniform_load_mode_skips_enrichment(self, _patch_meta_extractor):
+        client = _StubClient()
+        bb = self._bb_with_anchors([
+            {"center_sec": 15.0, "window_start_sec": 12.5, "window_end_sec": 17.5, "transcript": "hello"},
+        ])
+        plan = self._plan(load_mode="uniform")
+        observer = _avp_main.Observer(client)
+        ev = observer.observe(plan, bb)
+        assert ev.audio_enrichments == []
+
+    def test_region_load_mode_attaches_cached_transcripts(self, _patch_meta_extractor):
+        client = _StubClient()
+        bb = self._bb_with_anchors([
+            {"center_sec": 15.0, "window_start_sec": 12.5, "window_end_sec": 17.5, "transcript": "outside"},
+            {"center_sec": 32.0, "window_start_sec": 29.5, "window_end_sec": 34.5, "transcript": "in-region"},
+            {"center_sec": 90.0, "window_start_sec": 87.5, "window_end_sec": 92.5, "transcript": "outside"},
+        ])
+        plan = self._plan(load_mode="region", regions=[(25.0, 40.0)])
+        observer = _avp_main.Observer(client)
+        ev = observer.observe(plan, bb)
+        assert len(ev.audio_enrichments) == 1
+        assert ev.audio_enrichments[0].speech_evidence == "in-region"
+        # acoustic_evidence is deprecated under AAVP2 — must always be empty.
+        assert ev.audio_enrichments[0].acoustic_evidence == []
+
+    def test_audio_disabled_master_switch_skips_everything(self, _patch_meta_extractor):
+        client = _StubClient(audio_enabled=False)
+        bb = self._bb_with_anchors([
+            {"center_sec": 30.0, "window_start_sec": 27.5, "window_end_sec": 32.5, "transcript": "irrelevant"},
+        ])
+        plan = self._plan(load_mode="region", regions=[(25.0, 40.0)])
+        observer = _avp_main.Observer(client)
+        ev = observer.observe(plan, bb)
+        assert ev.audio_enrichments == []
+
+    def test_region_with_no_in_range_anchors_attaches_nothing(self, _patch_meta_extractor):
+        client = _StubClient()
+        bb = self._bb_with_anchors([
+            {"center_sec": 5.0, "window_start_sec": 2.5, "window_end_sec": 7.5, "transcript": "outside"},
+        ])
+        plan = self._plan(load_mode="region", regions=[(50.0, 60.0)])
+        observer = _avp_main.Observer(client)
+        ev = observer.observe(plan, bb)
+        assert ev.audio_enrichments == []
+
+
+# ===========================================================================
+# 12. Planner soft-evidence injection
+# ===========================================================================
+
+
+class TestPlanningPromptTimbreSoftEvidence:
+    # The rendered bullet format ``  - t≈X.Xs  speech: "..."`` is unique to
+    # ``_format_timbre_anchor_preview``; the literal phrase
+    # "Timbre-Anchor ASR Preview" and shorthand like ``t≈92s`` also appear
+    # in the static audio-handling guidance/exemplars, so we anchor the
+    # negative tests on the lowercase ``  speech: `` marker that only
+    # appears in actual rendered bullets.
+    _BULLET_MARKER = "  speech: "
+    _BANNER = "heuristic soft evidence — NOT ground truth"
+
+    def test_anchors_render_in_planning_prompt(self):
+        meta = {
+            "duration_sec": 60.0,
+            "timbre_anchors": [
+                {"center_sec": 10.0, "window_start_sec": 7.5, "window_end_sec": 12.5, "transcript": "hello world"},
+                {"center_sec": 25.0, "window_start_sec": 22.5, "window_end_sec": 27.5, "transcript": ""},
+            ],
+        }
+        prompt = PromptManager.get_planning_prompt("What was said?", meta)
+        assert self._BANNER in prompt
+        assert self._BULLET_MARKER in prompt
+        assert "t≈10.0s" in prompt
+        assert "hello world" in prompt
+        assert "(none / inaudible)" in prompt
+
+    def test_no_anchors_omits_section(self):
+        meta = {"duration_sec": 60.0, "timbre_anchors": []}
+        prompt = PromptManager.get_planning_prompt("What happens?", meta)
+        assert self._BANNER not in prompt
+        assert self._BULLET_MARKER not in prompt
+
+    def test_missing_timbre_key_omits_section(self):
+        meta = {"duration_sec": 60.0}
+        prompt = PromptManager.get_planning_prompt("What happens?", meta)
+        assert self._BANNER not in prompt
+        assert self._BULLET_MARKER not in prompt
+
+
+# ===========================================================================
+# 13. Integration test stubs (require API + real video)
 # ===========================================================================
 
 INTEGRATION_MARK = pytest.mark.skip(

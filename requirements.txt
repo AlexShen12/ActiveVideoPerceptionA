@@ -6,9 +6,16 @@ tqdm>=4.66.0
 
 # Numerical utilities
 numpy>=1.23.0
+scipy>=1.10.0
 
 # Deep learning (CPU by default; use conda for CUDA)
 torch>=2.0.0
 
 # Video / image processing
 opencv-python>=4.8.0
+
+# Audio: timbre boundary detection (librosa) + local ASR (faster-whisper).
+# Both are required when audio_enabled=true; the modules import lazily so a
+# pure-visual install can still skip them.  ffmpeg must be on PATH.
+librosa>=0.10.0
+faster-whisper>=1.0.0

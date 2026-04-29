@@ -97,7 +97,8 @@ from huggingface_hub import snapshot_download
 token = os.environ.get("HF_TOKEN")
 local_dir = "${OMNIVIDEO_LOCAL_DIR}"
 
-print(f"   Downloading {repr("${HF_REPO}")} → {local_dir}")
+repo_id = "${HF_REPO}"
+print(f"   Downloading {repr(repo_id)} → {local_dir}")
 print("   This may take a while for large video files...")
 sys.stdout.flush()
 

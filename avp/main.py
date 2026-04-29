@@ -76,11 +76,23 @@ from .prompt import (
     REFLECTION_SCHEMA,
 )
 
-# AAVP audio extraction utilities (ffmpeg-based, no local ASR)
+# AAVP audio extraction utilities.  ``extract_audio_snippet`` and
+# ``cleanup_audio_artifacts`` are still imported for the legacy
+# ``GeminiClient.enrich_with_audio`` path (kept for backward compatibility but
+# no longer driven by the Observer); ``generate_gap_probes`` is unused by the
+# new local-ASR pipeline.
 from .audio_utils import (
     extract_audio_snippet,
     generate_gap_probes,
     cleanup_audio_artifacts,
+)
+
+# AAVP2 — timbre-anchor preplan + local ASR.  Replaces the Gemini WAV
+# transcription pass for the active observation loop.
+from .timbre_anchor_cache import (
+    TimbreAnchor,
+    preplan_anchors,
+    filter_anchors_in_regions,
 )
 
 # Import video utilities
@@ -227,17 +239,20 @@ class PlanSpec:
 
 @dataclass
 class AudioEnrichment:
-    """Audio evidence gathered for a single timestamp from the visual pass.
+    """Audio evidence gathered for a single timestamp.
 
-    One ``AudioEnrichment`` corresponds to one WAV snippet extracted by
-    ``audio_utils.extract_audio_snippet`` and interpreted by Gemini.
+    Under AAVP2 each ``AudioEnrichment`` is a *speech-only* record produced
+    by the local Whisper pipeline.  ``speech_evidence`` carries the
+    transcript; ``acoustic_evidence`` is retained as an empty list for
+    backward-compatibility with persisted JSON but is no longer populated
+    (closed-tag acoustic labelling is deprecated).
 
     Fields:
         center_sec:       Midpoint of the audio window in original video seconds.
         window_start_sec: Actual extraction start (= center_sec - halfwidth, clamped).
         window_end_sec:   Actual extraction end  (= center_sec + halfwidth).
-        speech_evidence:  Verbatim word-bounded transcript; empty string if inaudible.
-        acoustic_evidence: Closed-tag acoustic labels drawn from the config vocabulary.
+        speech_evidence:  faster-whisper transcript; empty string if inaudible.
+        acoustic_evidence: Deprecated; always empty under the local-ASR pipeline.
         source:           "evidence" (from key_evidence) or "gap_probe".
     """
     center_sec: float
@@ -361,13 +376,15 @@ class Blackboard:
         """Format all audio enrichment evidence for use in prompts.
 
         Produces a compact timestamped block suitable for the reflector and
-        synthesis prompts.  Example output line::
+        synthesis prompts.  Under AAVP2 each line is speech-only::
 
-            t=45.0s [evidence] | Speech: "Welcome back everyone" | Acoustic: [SPEECH, MUSIC]
-            t=75.0s [gap_probe] | Speech: "" | Acoustic: [AMBIENT]
+            t=45.0s [evidence] | Speech: "Welcome back everyone"
+            t=75.0s [evidence] | Speech: ""
 
-        Returns empty string when no audio enrichments exist (audio_enrichment=off
-        or audio step produced no results), so callers can test truthiness.
+        Legacy ``acoustic_evidence`` lists are still rendered when present so
+        evidence loaded from old runs continues to surface; new local-ASR
+        runs always emit empty acoustic lists which are omitted from the
+        output.  Returns empty string when no audio enrichments exist.
         """
         lines = []
         for ev in self.evidences:
@@ -411,10 +428,12 @@ class Blackboard:
 
             lines.append(entry)
 
-        # Append audio enrichment block when any enrichments exist
+        # Append audio enrichment block when any enrichments exist.  Header
+        # naming reflects the AAVP2 local-Whisper pipeline so downstream
+        # prompts stay consistent.
         audio_text = self.audio_enrichment_summary_text()
         if audio_text:
-            lines.append(f"\n[Audio Enrichment Findings]\n{audio_text}")
+            lines.append(f"\n[Regional Speech Transcripts]\n{audio_text}")
 
         if self.query_confidence is not None:
             lines.append(f"\n[Overall Query Confidence: {self.query_confidence:.2f}]")
@@ -1278,7 +1297,7 @@ class GeminiClient:
         return Part(inlineData=Blob(mime_type="audio/wav", data=data))
 
     # ------------------------------------------------------------------
-    # 7a. Post-observation audio enrichment
+    # 7a. Post-observation audio enrichment (LEGACY — deprecated)
     # ------------------------------------------------------------------
 
     def enrich_with_audio(
@@ -1290,12 +1309,18 @@ class GeminiClient:
         duration_sec: float,
         visual_summary: str = "",
     ) -> List["AudioEnrichment"]:
-        """Post-hoc audio enrichment on model-chosen timestamps.
+        """DEPRECATED — Gemini WAV transcription pass.
 
-        Runs after the visual observation.  Extracts short WAV snippets
-        centred on the timestamps returned by the visual pass, optionally
-        adds sparse gap probes, then sends all snippets in one Gemini call
-        for structured speech/acoustic interpretation.
+        Replaced by the AAVP2 local pipeline (``preplan_anchors`` +
+        ``filter_anchors_in_regions`` in :class:`Observer`).  Retained so
+        external callers and existing tests continue to import the symbol,
+        but the Observer no longer invokes this method.  Will be removed
+        once downstream consumers migrate.
+
+        Original behaviour: extract short WAV snippets centred on the
+        timestamps returned by the visual pass, optionally add sparse gap
+        probes, then send all snippets in one Gemini call for structured
+        speech/acoustic interpretation.
 
         Steps:
             1. Collect midpoints from ``evidence.key_evidence`` timestamps.
@@ -1842,27 +1867,62 @@ class Observer:
             print(f"Reasoning: {ev.reasoning[:200]}...")
             print(f"{'='*80}\n")
 
-        # === AAVP audio enrichment (post-observation, runs only when enabled) ===
-        # Respect the audio_enabled master switch when an AVPConfig is attached.
-        # If no config is present (legacy / unit-test paths) fall through to the
-        # planner-decided audio_enrichment scope as before.
+        # === AAVP2 audio enrichment (post-observation, local-ASR pipeline) ===
+        # Replaces the deprecated ``GeminiClient.enrich_with_audio`` Gemini WAV
+        # transcription path with a cache-aware local pass.
+        #
+        # Behavior:
+        #   * Master switch off (audio_enabled=False) → no-op.
+        #   * load_mode == "uniform"  → no-op.  The preplan timbre/ASR pass
+        #     already provided full-timeline soft evidence to the planner;
+        #     re-running ASR per round would duplicate that work.
+        #   * load_mode == "region"   → attach the preplan transcripts whose
+        #     timbre anchors fall inside ``watch_cfg.regions``.  Duplicate
+        #     ASR calls are suppressed because we read from the cached
+        #     anchors rather than re-running Whisper.
         _avp_cfg = getattr(self.client, "_avp_config", None)
-        _audio_globally_enabled = (_avp_cfg is None) or bool(_avp_cfg.audio_enabled)
-        if _audio_globally_enabled and plan.watch.audio_enrichment != AudioEnrichmentScope.off:
-            audio_enrichments = self.client.enrich_with_audio(
-                evidence=ev,
-                video_path=bb.video_path,
-                query=plan.query,
-                watch_cfg=plan.watch,
-                duration_sec=duration,
-                visual_summary=ev.detailed_response,
+        _audio_globally_enabled = _avp_cfg is not None and bool(_avp_cfg.audio_enabled)
+        if (
+            _audio_globally_enabled
+            and watch_cfg.load_mode == "region"
+            and watch_cfg.regions
+        ):
+            preplan = bb.meta.get("preplan_timbre_anchors", []) or []
+            anchors_in_region = [
+                TimbreAnchor(
+                    center_sec=float(a.get("center_sec", 0.0)),
+                    window_start_sec=float(a.get("window_start_sec", 0.0)),
+                    window_end_sec=float(a.get("window_end_sec", 0.0)),
+                    transcript=str(a.get("transcript", "")),
+                )
+                for a in preplan
+                if isinstance(a, dict)
+            ]
+            anchors_in_region = filter_anchors_in_regions(
+                anchors_in_region, list(watch_cfg.regions)
             )
+            audio_enrichments = [
+                AudioEnrichment(
+                    center_sec=a.center_sec,
+                    window_start_sec=a.window_start_sec,
+                    window_end_sec=a.window_end_sec,
+                    speech_evidence=a.transcript,
+                    acoustic_evidence=[],  # closed-tag acoustics deprecated
+                    source="evidence",
+                )
+                for a in anchors_in_region
+            ]
             ev.audio_enrichments = audio_enrichments
             if self.client.debug and audio_enrichments:
                 print(
-                    f"🔊 Audio enrichment complete: {len(audio_enrichments)} snippet(s) "
-                    f"attached to evidence round {ev.round_id}"
+                    f"🔊 Regional ASR enrichment: attached {len(audio_enrichments)} cached "
+                    f"transcript(s) for round {ev.round_id} (no duplicate Whisper calls)"
                 )
+        elif self.client.debug and _audio_globally_enabled and watch_cfg.load_mode == "uniform":
+            print(
+                "🔇 Uniform load_mode: skipping post-observation audio "
+                "(preplan timbre/ASR already covered the full timeline)"
+            )
 
         bb.add_evidence(ev)
         return ev
@@ -2293,6 +2353,7 @@ class Controller:
             print(f"📁 Using unique temp_clips directory: {self.client.temp_clips_dir}")
         self._init_meta()
         self._propagate_audio_config()
+        self._run_preplan_anchors()
 
     # ---------- AAVP config propagation ----------
     def _propagate_audio_config(self) -> None:
@@ -2304,6 +2365,60 @@ class Controller:
         self.client.audio_max_snippets_per_round = cfg.audio_max_snippets_per_round
         self.client.audio_gap_probes = cfg.audio_gap_probes
         self.client.audio_closed_tags = list(cfg.audio_closed_tags)
+
+    # ---------- AAVP2 preplan timbre anchors ----------
+    def _run_preplan_anchors(self) -> None:
+        """Compute timbre boundaries + local ASR transcripts before planning.
+
+        Cache-aware: subsequent runs on the same video (same path/size/mtime
+        and matching anchor/window/whisper-model parameters) reuse the saved
+        JSON without re-running librosa or Whisper.
+
+        Stores results on ``self.bb.meta["preplan_timbre_anchors"]`` as a
+        list of plain dicts so they survive ``dataclasses.asdict`` and JSON
+        serialisation; the Planner reads them as soft evidence and the
+        Observer reuses them for in-region speech enrichment, suppressing
+        duplicate ASR calls (the cached transcript is reused as-is).
+        """
+        cfg = getattr(self.client, "_avp_config", None)
+        if cfg is None or not getattr(cfg, "audio_enabled", False):
+            self.bb.meta["preplan_timbre_anchors"] = []
+            return
+
+        cache_dir = cfg.resolve_audio_cache_dir()
+        try:
+            anchors = preplan_anchors(
+                self.bb.video_path,
+                duration_sec=float(self.bb.duration_sec or 0.0),
+                cache_dir=cache_dir,
+                anchor_interval_sec=cfg.timbre_anchor_interval_sec,
+                timbre_window_sec=cfg.timbre_window_sec,
+                sample_rate=cfg.audio_sample_rate,
+                whisper_model=cfg.whisper_model,
+                whisper_device=cfg.whisper_device,
+                whisper_compute_type=cfg.whisper_compute_type,
+                temp_dir=self.client.temp_clips_dir,
+                debug=self.client.debug,
+            )
+        except Exception as exc:
+            if self.client.debug:
+                print(f"⚠️  [preplan] failed for {self.bb.video_path}: {exc}")
+            anchors = []
+
+        self.bb.meta["preplan_timbre_anchors"] = [
+            {
+                "center_sec": a.center_sec,
+                "window_start_sec": a.window_start_sec,
+                "window_end_sec": a.window_end_sec,
+                "transcript": a.transcript,
+            }
+            for a in anchors
+        ]
+        if self.client.debug:
+            print(
+                f"🎼 [preplan] {len(anchors)} timbre anchor(s) ready for "
+                f"{self.bb.video_path}"
+            )
 
     # ---------- meta ----------
     def _init_meta(self) -> None:
@@ -2326,9 +2441,12 @@ class Controller:
     def plan(self, query: str) -> PlanSpec:
         """Generate initial plan with video metadata."""
         planner = Planner(self.client)
-        # Prepare video metadata for planning (only duration is needed!)
+        # Prepare video metadata for planning.  The preplan timbre/ASR
+        # anchors travel as soft evidence: the planner is told they are
+        # heuristic, not ground truth for QA.
         video_meta = {
             "duration_sec": self.bb.duration_sec,
+            "timbre_anchors": self.bb.meta.get("preplan_timbre_anchors", []),
         }
         # Get options from blackboard if available
         options = self.bb.meta.get("options", None)
@@ -2495,7 +2613,10 @@ class Controller:
                 if self.client.debug:
                     print(f"❌ Evidence insufficient. Replanning with all evidence and history...")
 
-                video_meta = {"duration_sec": self.bb.duration_sec}
+                video_meta = {
+                    "duration_sec": self.bb.duration_sec,
+                    "timbre_anchors": self.bb.meta.get("preplan_timbre_anchors", []),
+                }
                 plan = self.client.plan(query, video_meta=video_meta, prior=self.bb, options=options)
 
                 # Override plan with targeted instructions from the structured reflector.

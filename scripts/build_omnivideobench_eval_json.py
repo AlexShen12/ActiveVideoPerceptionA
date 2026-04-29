@@ -26,6 +26,15 @@ OmniVideoBench's canonical annotation is a nested JSON list:
 The HuggingFace snapshot may also ship a data.parquet file in a row-per-question
 layout. Both are supported: pass --input for JSON, --parquet for parquet.
 
+Selection order (``--length-bucket`` and ``--max-videos``)
+──────────────────────────────────────────────────────────
+**Bucket filter is applied to the full annotation first**, then ``--max-videos N``
+keeps the first *N* **top-level videos** in file order *within the filtered set*.
+So e.g. ``--length-bucket ultralong --max-videos 30`` means: among *all* clips
+classified as ultralong by duration, take the *first 30* such videos in list order.
+It does **not** mean: take the first 30 videos in the file, then keep only
+ultralongs (that would be a different subset).
+
 Output format
 ─────────────
 One flat JSON array with one record per QA pair, shaped exactly as
@@ -66,11 +75,20 @@ Usage
       --video-root /data/omnivideobench/videos \\
       --output eval_omnivideo_with_paths.json \\
       --max-videos 30
+
+  # First 30 *Ultralong* videos only (>10 min) — per OmniVideoBench paper (Fig. 3)
+  python scripts/build_omnivideobench_eval_json.py \\
+      --input  /data/omnivideobench/data.json \\
+      --video-root /data/omnivideobench/videos \\
+      --output eval_omnivideo_with_paths.json \\
+      --length-bucket ultralong \\
+      --max-videos 30
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -79,9 +97,21 @@ from pathlib import Path
 
 def parse_duration(s: str | None) -> float | None:
     """Parse 'MM:SS' or 'HH:MM:SS' duration string to seconds. Returns None on failure."""
+    if s is None:
+        return None
+    # Direct numeric (seconds): int, float, numpy scalars, etc.
+    if not isinstance(s, str) and not isinstance(s, bool):
+        try:
+            x = float(s)
+            if math.isnan(x) or math.isinf(x):
+                return None
+            return x
+        except (TypeError, ValueError):
+            return None
+    s = str(s).strip()
     if not s:
         return None
-    parts = str(s).strip().split(":")
+    parts = s.split(":")
     try:
         if len(parts) == 2:
             return int(parts[0]) * 60 + int(parts[1])
@@ -94,6 +124,74 @@ def parse_duration(s: str | None) -> float | None:
         return float(s)
     except (ValueError, TypeError):
         return None
+
+
+# OmniVideoBench paper (Fig. 3): duration categories (seconds)
+#   Short    : < 1 min
+#   Medium   : 1–5 min
+#   Long     : 5–10 min
+#   Ultrlong : > 10 min
+
+
+def classify_omnivideo_duration_sec(sec: float) -> str:
+    """Map duration in seconds to OmniVideoBench's official bucket name."""
+    if sec < 60.0:
+        return "short"
+    if sec < 300.0:  # < 5 min
+        return "medium"
+    if sec <= 600.0:  # 5 min through 10:00
+        return "long"
+    return "ultralong"
+
+
+def in_length_bucket(sec: float | None, length_bucket: str) -> bool:
+    """If length_bucket is 'all', accept any row with a known duration; else match bucket."""
+    if length_bucket == "all":
+        return True
+    if sec is None:
+        return False
+    return classify_omnivideo_duration_sec(sec) == length_bucket
+
+
+# Video filename extensions we treat as "already has an extension" (no --ext append).
+_KNOWN_VIDEO_SUFFIXES: tuple[str, ...] = (
+    ".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv"
+)
+
+
+def resolve_video_path(video_root: Path, video_field: str, ext: str) -> Path:
+    """Map annotation `video` id / relpath to a local file path.
+
+    HuggingFace parquet often stores values like ``videos/video_25.mp4`` (relative
+    to the dataset root) while the user points ``--video-root`` at the
+    ``.../videos`` directory. Naive join would create ``.../videos/videos/...``.
+
+    The same data may also use ``video_25.mp4``; appending ``--ext`` would yield
+    ``video_25.mp4.mp4``. We only append *ext* when the relative path has no
+    known video extension on its last component.
+    """
+    v = str(video_field).strip().replace("\\", "/")
+    if not v or v in (".", ".."):
+        return video_root / f"_invalid_{video_field!s}{ext}"
+
+    try:
+        root_r = video_root.resolve()
+    except OSError:
+        root_r = video_root
+
+    # Drop a redundant leading "videos/" when the user already chdir'd into that folder.
+    if root_r.name.lower() == "videos":
+        pfx = "videos/"
+        if v[: len(pfx)].lower() == pfx:
+            v = v[len(pfx) :]
+
+    # Last path component: if it already looks like a video file, do not add ext.
+    rel = Path(v)
+    last = rel.name.lower()
+    if any(last.endswith(sfx) for sfx in _KNOWN_VIDEO_SUFFIXES):
+        return video_root / v
+    ex = ext if ext.startswith(".") else f".{ext}"
+    return video_root / f"{v}{ex}"
 
 
 # ── Record builder ────────────────────────────────────────────────────────────
@@ -138,6 +236,7 @@ def load_from_json(
     ext: str,
     max_videos: int | None,
     keep_missing: bool,
+    length_bucket: str = "all",
 ) -> tuple[list[dict], int]:
     with open(input_path) as f:
         data = json.load(f)
@@ -145,9 +244,31 @@ def load_from_json(
     if not isinstance(data, list):
         sys.exit(f"Expected a JSON array at the top level, got {type(data).__name__}")
 
+    n_before = len(data)
+    if length_bucket != "all":
+        filtered: list[dict] = []
+        dropped = 0
+        for entry in data:
+            dur_s = parse_duration(entry.get("duration"))
+            if in_length_bucket(dur_s, length_bucket):
+                filtered.append(entry)
+            else:
+                dropped += 1
+        data = filtered
+        print(
+            f"Length-bucket {length_bucket!r}: {len(data)} of {n_before} top-level video "
+            f"entries (dropped {dropped} outside bucket)"
+        )
+        if not data:
+            print(
+                "No videos left after length-bucket filter. "
+                "Check annotations or use --length-bucket all.",
+                file=sys.stderr,
+            )
+
     if max_videos and max_videos > 0:
         data = data[:max_videos]
-        print(f"Sliced to first {max_videos} video entries → {len(data)} entries")
+        print(f"Sliced to first {max_videos} video entries in bucket order → {len(data)} entries")
 
     records: list[dict] = []
     skipped = 0
@@ -155,7 +276,7 @@ def load_from_json(
     for entry in data:
         video_id = str(entry.get("video", "unknown"))
         duration_str = str(entry.get("duration", "")) or None
-        video_path = video_root / f"{video_id}{ext}"
+        video_path = resolve_video_path(video_root, video_id, ext)
 
         if not video_path.is_file():
             skipped += 1
@@ -193,12 +314,33 @@ def load_from_json(
 
 # ── Parquet path ──────────────────────────────────────────────────────────────
 
+def _row_duration_sec(row: object) -> float | None:
+    """Get duration in seconds from a pandas Series row (best-effort)."""
+    import pandas as pd
+
+    if not isinstance(row, pd.Series):
+        return None
+    for key in ("duration", "video_duration", "duration_sec", "length"):
+        if key not in row.index:
+            continue
+        s = row[key]
+        if s is None or (isinstance(s, float) and math.isnan(s)):
+            continue
+        if isinstance(s, str) and not s.strip():
+            continue
+        p = parse_duration(s)
+        if p is not None:
+            return p
+    return None
+
+
 def load_from_parquet(
     parquet_path: Path,
     video_root: Path,
     ext: str,
     max_videos: int | None,
     keep_missing: bool,
+    length_bucket: str = "all",
 ) -> tuple[list[dict], int]:
     try:
         import pandas as pd
@@ -214,11 +356,34 @@ def load_from_parquet(
     # Detect the video column — OmniVideoBench uses "video"; fall back to "video_id".
     video_col = "video" if "video" in df.columns else "video_id"
 
+    n_before = len(df)
+    if length_bucket != "all":
+        mask: list[bool] = []
+        for i in range(len(df)):
+            sec = _row_duration_sec(df.iloc[i])
+            mask.append(in_length_bucket(sec, length_bucket))
+        df = df.loc[mask].reset_index(drop=True)  # type: ignore[assignment]
+        print(
+            f"Length-bucket {length_bucket!r}: {len(df)} of {n_before} rows "
+            f"(dropped {n_before - len(df)} outside bucket)"
+        )
+        if len(df) == 0:
+            print(
+                "No rows left after length-bucket filter. "
+                "Check parquet columns or use --length-bucket all.",
+                file=sys.stderr,
+            )
+
     if max_videos and max_videos > 0:
-        unique_vids = list(dict.fromkeys(str(v) for v in df[video_col]))
+        unique_vids: list[str] = []
+        seen: set[str] = set()
+        for v in df[video_col].astype(str):
+            if v not in seen:
+                seen.add(v)
+                unique_vids.append(v)
         keep_ids = set(unique_vids[:max_videos])
         df = df[df[video_col].astype(str).isin(keep_ids)].reset_index(drop=True)
-        print(f"Filtered to first {max_videos} unique videos → {len(df)} rows")
+        print(f"Filtered to first {max_videos} unique videos in bucket order → {len(df)} rows")
 
     # Detect answer column: prefer "correct_option", then "answer".
     answer_col = (
@@ -237,7 +402,7 @@ def load_from_parquet(
 
     for _, row in df.iterrows():
         video_id = str(row[video_col])
-        video_path = video_root / f"{video_id}{ext}"
+        video_path = resolve_video_path(video_root, video_id, ext)
 
         if not video_path.is_file():
             skipped += 1
@@ -282,6 +447,7 @@ def load_from_hub(
     ext: str,
     max_videos: int | None,
     keep_missing: bool,
+    length_bucket: str = "all",
 ) -> tuple[list[dict], int]:
     try:
         from datasets import load_dataset
@@ -305,6 +471,7 @@ def load_from_hub(
             ext=ext,
             max_videos=max_videos,
             keep_missing=keep_missing,
+            length_bucket=length_bucket,
         )
     finally:
         os.unlink(tmp.name)
@@ -361,8 +528,18 @@ def main() -> None:
         default=None,
         metavar="N",
         help=(
-            "Only include questions for the first N unique video entries "
-            "(e.g. --max-videos 30)"
+            "Only include questions for the first N top-level video entries "
+            "after optional --length-bucket filter, in file order (e.g. 30)"
+        ),
+    )
+    ap.add_argument(
+        "--length-bucket",
+        default="all",
+        choices=["all", "short", "medium", "long", "ultralong"],
+        help=(
+            "Filter to OmniVideoBench duration category (paper Fig. 3, by clip length in seconds): "
+            "short <1 min, medium 1-5 min, long 5-10 min, ultrlong >10 min. "
+            "Default: all (no filter). Use 'ultralong' for the >10 min split from the paper."
         ),
     )
     ap.add_argument(
@@ -407,6 +584,7 @@ def main() -> None:
             ext=args.ext,
             max_videos=args.max_videos,
             keep_missing=args.keep_missing,
+            length_bucket=args.length_bucket,
         )
     elif args.parquet:
         parquet_path = Path(args.parquet)
@@ -418,6 +596,7 @@ def main() -> None:
             ext=args.ext,
             max_videos=args.max_videos,
             keep_missing=args.keep_missing,
+            length_bucket=args.length_bucket,
         )
     else:
         records, skipped = load_from_hub(
@@ -425,6 +604,7 @@ def main() -> None:
             ext=args.ext,
             max_videos=args.max_videos,
             keep_missing=args.keep_missing,
+            length_bucket=args.length_bucket,
         )
 
     out_path = Path(args.output)

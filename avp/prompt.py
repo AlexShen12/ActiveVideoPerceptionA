@@ -278,6 +278,46 @@ REFLECTION_SCHEMA = {
 # Prompt Templates
 # ======================================================
 
+
+def _format_timbre_anchor_preview(
+    anchors: Optional[List[Dict[str, Any]]],
+    *,
+    max_lines: int = 30,
+) -> str:
+    """Format the preplan timbre-anchor ASR preview as a soft-evidence block.
+
+    Returns an empty string when no usable anchors are present so callers
+    can ``if block:`` and conditionally include the section header.  The
+    block is explicitly labelled as heuristic (timbre boundaries are not
+    silence detection; ASR is local Whisper, not Gemini) so the planner
+    treats it as a hint rather than ground truth for QA.
+    """
+    if not anchors:
+        return ""
+    lines = []
+    used = 0
+    for a in anchors:
+        if not isinstance(a, dict):
+            continue
+        try:
+            center = float(a.get("center_sec", 0.0))
+        except (TypeError, ValueError):
+            continue
+        transcript = (a.get("transcript") or "").strip()
+        snippet = transcript[:160] + "…" if len(transcript) > 160 else transcript
+        if snippet:
+            lines.append(f"  - t≈{center:.1f}s  speech: \"{snippet}\"")
+        else:
+            lines.append(f"  - t≈{center:.1f}s  speech: (none / inaudible)")
+        used += 1
+        if used >= max_lines:
+            remaining = len(anchors) - used
+            if remaining > 0:
+                lines.append(f"  - … {remaining} more anchor(s) elided")
+            break
+    return "\n".join(lines)
+
+
 class PromptManager:
     """Manages all prompts for the agentic video framework."""
 
@@ -313,13 +353,31 @@ class PromptManager:
             options_text = "\n".join([f"- {opt}" for opt in options])
             full_query = f"{query}\n\nOptions:\n{options_text}"
 
+        # AAVP2 soft-evidence: timbre-anchor ASR preview gathered before
+        # planning by the local pipeline.  Empty string when audio is
+        # disabled or no anchors were produced.
+        timbre_block_body = _format_timbre_anchor_preview(
+            video_meta.get("timbre_anchors")
+        )
+        if timbre_block_body:
+            timbre_section = (
+                "\n    **Timbre-Anchor ASR Preview (heuristic soft evidence — NOT ground truth):**\n"
+                "    Pre-planned local Whisper transcripts at MFCC-derived timbre boundaries\n"
+                "    (~one anchor per 15s).  Use only as a hint to choose region vs uniform\n"
+                "    scans and to bias spatial/fps decisions; verify everything with the\n"
+                "    visual pass before answering.\n"
+                f"{timbre_block_body}\n"
+            )
+        else:
+            timbre_section = ""
+
         prompt = f"""You are an expert video analysis planner. Create a concise, single-action observation plan (ONE step) to answer the user's query this round.
 
     **User Query:** {full_query}
 
     **Video Information:**
     - Duration: {duration} seconds
-
+{timbre_section}
     **Planning Framework:**
     Each action A_t in your plan must specify three key components:
     1. **Goal (Reasoning Objective)**: The step's reasoning objective - what you're trying to accomplish
@@ -333,27 +391,37 @@ class PromptManager:
     3. **Sampling Granularity**: The fps (frames per second) and resolution settings
        - "fps": Controls temporal sampling rate (0.1-5.0, lower = sparser sampling)
        - "spatial_token_rate": Controls spatial resolution ("low" or "medium", lower = coarser spatial detail)
-    4. **Audio Enrichment** (AAVP — post-observation audio analysis, default off):
-       - "audio_enrichment": Controls whether audio is analysed after the visual pass
-         * "off": No audio — pure visual (default, backward compatible)
-         * "evidence_only": After the visual pass, extract audio around each key_evidence
-           timestamp and send to the model for speech/acoustic interpretation
-         * "evidence_plus_gaps": Same as evidence_only, plus sparse audio probes at the
-           midpoints of large uncovered timeline gaps (catches off-screen narration/sounds)
-       - "audio_mode": Steers the audio interpretation prompt
-         * "balanced": Both verbatim speech transcription and acoustic event tagging
-         * "asr_focus": Prioritise verbatim speech extraction (reasoning-heavy queries)
-         * "acoustic_focus": Prioritise non-speech event detection (event-tracking queries)
+    4. **Audio Handling** (AAVP2 — local pipeline, no extra Gemini calls):
+       The "audio_enrichment" / "audio_mode" fields are accepted for backward
+       compatibility but are interpreted by the new pipeline as follows:
+         * Audio interpretation now happens locally via Whisper at MFCC-derived
+           timbre boundaries (one anchor per ~15 s of video).  Those transcripts
+           are already shown above as the Timbre-Anchor ASR Preview when audio
+           is enabled.
+         * When load_mode == "uniform", the post-observation audio step is a
+           no-op: the planner-level preview already provided full-timeline
+           audio coverage and no additional ASR is run.
+         * When load_mode == "region", the Observer attaches the preplan
+           transcripts whose timbre anchors fall inside the chosen regions to
+           that round's evidence.  No duplicate ASR call is made (cached
+           transcripts are reused).
+         * Closed-tag acoustic event tagging is deprecated; "audio_mode" is
+           now informational only.
+       You may still set audio_enrichment to "evidence_only" or
+       "evidence_plus_gaps" to signal that speech/acoustic context matters,
+       but the actual extraction is decided by load_mode (uniform → no-op,
+       region → cached transcripts only).
 
-    **Audio Trigger Heuristics (use these to set audio_enrichment):**
-    - Query contains "said", "told", "narrator", "dialogue", "speaks", "voice", "heard", "listen"
-      → audio_enrichment: "evidence_only", audio_mode: "asr_focus"
-    - Query references sounds: "whistle", "buzzer", "crash", "music", "applause", "bell", "alarm"
-      → audio_enrichment: "evidence_only", audio_mode: "acoustic_focus"
-    - Query is purely visual ("color of", "how many", "identify the object", "what is shown")
-      → audio_enrichment: "off"
-    - When in doubt → audio_enrichment: "evidence_only", audio_mode: "balanced"
-      (adds only one extra API call after the visual pass)
+    **Audio Trigger Heuristics:**
+    - Query mentions "said", "told", "narrator", "dialogue", "speaks", "voice",
+      "heard", "listen", or specific sounds ("whistle", "music", "applause"):
+      consult the Timbre-Anchor ASR Preview above to localise the relevant
+      moment, then prefer load_mode="region" with [start, end] covering the
+      candidate anchor.
+    - Query is purely visual ("color of", "how many", "identify the object",
+      "what is shown"): set audio_enrichment="off" and use uniform sampling.
+    - When in doubt: leave audio_enrichment="off" and rely on the visual pass
+      plus the preplan preview.
 
     **Your Planning Strategy:**
     1. **Coarse-to-Fine Strategy**: Start with broad uniform scans (low fps, low resolution) to locate candidate regions, then zoom in with higher detail.
@@ -488,23 +556,23 @@ class PromptManager:
     "completion_criteria": "Observation complete when final scene is analyzed"
     }}
 
-    - Audio-enriched scan (narrator/speech query):
+    - Speech-driven query (use Timbre-Anchor ASR Preview to localise):
     {{
-    "reasoning": "Query asks what the narrator said. Need audio enrichment after visual scan to capture speech.",
+    "reasoning": "Query asks what the narrator said about an ingredient. The Timbre-Anchor ASR Preview shows a relevant transcript at t≈92s, so a tight region around that anchor is sufficient — uniform scans skip audio entirely.",
     "steps": [
         {{
         "step_id": "1",
-        "description": "Uniform scan to locate key visual moments, then enrich with audio around those timestamps",
+        "description": "Region scan around the timbre anchor whose transcript matches the query",
         "sub_query": "What does the narrator say about the recipe ingredient?",
-        "load_mode": "uniform",
-        "fps": 0.5,
+        "load_mode": "region",
+        "fps": 1.0,
         "spatial_token_rate": "low",
-        "regions": [],
-        "audio_enrichment": "evidence_plus_gaps",
+        "regions": [[80.0, 105.0]],
+        "audio_enrichment": "evidence_only",
         "audio_mode": "asr_focus"
         }}
     ],
-    "completion_criteria": "Locate key visual moments and capture narrator speech via audio enrichment"
+    "completion_criteria": "Cached transcripts inside the region are attached automatically; no extra ASR call is needed"
     }}
 
     **Output Format (STRICT JSON ONLY):**
@@ -665,14 +733,27 @@ Analyze the video now and respond with JSON only."""
         if options:
             options_text = "\n".join([f"- {opt}" for opt in options])
             full_query = f"{query}\n\nOptions:\n{options_text}"
-        
+
+        timbre_block_body = _format_timbre_anchor_preview(
+            video_meta.get("timbre_anchors")
+        )
+        if timbre_block_body:
+            timbre_section = (
+                "\n**Timbre-Anchor ASR Preview (heuristic soft evidence — NOT ground truth):**\n"
+                "Local Whisper transcripts at MFCC-derived timbre boundaries; use as hints\n"
+                "for region selection only.\n"
+                f"{timbre_block_body}\n"
+            )
+        else:
+            timbre_section = ""
+
         prompt = f"""You are replanning a video observation after previous evidence was insufficient.
 
 **User Query:** {full_query}
 
 **Video Information:**
 - Duration: {duration} seconds
-
+{timbre_section}
 **Evidence Gathered from Previous Rounds:**
 {evidence_summary}
 
@@ -689,21 +770,29 @@ Based on the evidence gathered so far and what's still missing, plan a NEW singl
    - If previous region search failed → try uniform scan with different fps/resolution
    - If evidence is ambiguous → try higher fps or different spatial resolution
    - If specific timestamps mentioned in query → focus on those exact regions
-4. **Audio escalation** (AAVP):
-   - If previous visual-only scan was insufficient and query involves speech or sound →
-     enable audio_enrichment "evidence_only" or "evidence_plus_gaps"
-   - If reflector flagged MODALITY_MISMATCH → use the zoom_region with
-     audio_enrichment "evidence_plus_gaps" and spatial_token_rate "medium"
-   - If reflector flagged TEMPORAL_GAP → widen the observation window or enable
-     "evidence_plus_gaps" to catch off-screen narration/sounds in timeline gaps
+4. **Audio escalation** (AAVP2 — local pipeline):
+   - The Timbre-Anchor ASR Preview above (if present) already reflects the
+     full-timeline local Whisper transcripts.  No extra Gemini audio call is
+     made; ``audio_enrichment`` is informational and audio extraction only
+     happens when load_mode == "region" (cached transcripts inside the
+     chosen regions are attached as evidence).
+   - If previous visual-only scan was insufficient and the query involves
+     speech or sound → re-read the preview to pick a focused region, then
+     replan with load_mode="region" covering that anchor's neighbourhood.
+   - If reflector flagged MODALITY_MISMATCH → choose load_mode="region" over
+     the zoom_region; the cached transcripts inside that region will be
+     attached automatically.
+   - If reflector flagged TEMPORAL_GAP → widen the region (or split into a
+     second region) so the relevant timbre anchors fall inside it.
 
 **Planning Guidelines:**
 - load_mode: "uniform" (full video) or "region" (specific time spans)
 - fps: 0.1-5.0 (lower = sparser sampling, higher = denser)
 - spatial_token_rate: "low" or "medium" (lower = coarser spatial detail)
 - regions: [[start, end]] in seconds (empty for uniform mode)
-- audio_enrichment: "off" | "evidence_only" | "evidence_plus_gaps" (default "off")
-- audio_mode: "balanced" | "asr_focus" | "acoustic_focus" (default "balanced")
+- audio_enrichment / audio_mode: accepted but informational under AAVP2.
+  Audio interpretation runs locally; uniform = no-op, region = cached
+  transcripts inside the region are attached automatically.
 
 **IMPORTANT:** Generate exactly ONE observation action (steps array must have exactly 1 item).
 
@@ -893,23 +982,29 @@ Your job is to assess whether the evidence gathered so far is sufficient to answ
 ---
 
 **Your Task:**
-1. Evaluate whether the combined visual + audio evidence can answer the query.
-2. For each modality (visual, speech, acoustic) assign a support score 0.0–1.0.
-3. Cite the specific timestamps and quotes/tags that most support or undermine the answer.
-4. If evidence is insufficient, assign the most accurate reason code and provide a targeted `zoom_region` + `required_modalities` to guide the next plan.
+1. Evaluate whether the combined visual + speech evidence can answer the query.
+2. Assign support scores 0.0–1.0 for ``visual`` and ``speech``.  ``acoustic``
+   is deprecated under the local-ASR pipeline; leave it at 0.0.
+3. Cite the specific timestamps and quotes that most support or undermine the answer.
+4. If evidence is insufficient, assign the most accurate reason code and
+   provide a targeted ``zoom_region`` to guide the next plan.
 
 **Reason Code Guide:**
 - `SUFFICIENT`        — Evidence clearly answers the query. Set sufficient=true.
-- `MODALITY_MISMATCH` — Query requires a modality not yet captured (e.g. speech query but no audio enrichment ran). Provide required_modalities to escalate.
+- `MODALITY_MISMATCH` — Query requires speech but the relevant timbre anchor's
+                        transcript was not yet attached.  Use zoom_region to
+                        cover that anchor so the next round picks it up.
 - `TEMPORAL_GAP`      — The relevant time window was not covered. Provide zoom_region.
 - `LOW_CONFIDENCE`    — Evidence exists but is too ambiguous. Suggest higher fps or spatial_token_rate.
 - `NO_EVIDENCE`       — Observation returned nothing useful. Suggest a different region or approach.
 
-**Required Modalities Hint (only when insufficient):**
-- If speech is needed: {{"audio_enrichment": "evidence_plus_gaps", "spatial_token_rate": "low"}}
-- If acoustic events are needed: {{"audio_enrichment": "evidence_only", "spatial_token_rate": "low"}}
-- If visual detail is needed: {{"audio_enrichment": "off", "spatial_token_rate": "medium"}}
-- If both modalities need escalation: {{"audio_enrichment": "evidence_plus_gaps", "spatial_token_rate": "medium"}}
+**Required Modalities Hint (informational under AAVP2):**
+- ``audio_enrichment`` values (``"off"`` | ``"evidence_only"`` |
+  ``"evidence_plus_gaps"``) are accepted for backward compatibility but no
+  longer change the audio path.  The Controller picks region vs uniform
+  based on ``zoom_region``; cached transcripts inside the region are
+  attached automatically.  Use ``spatial_token_rate`` ("low" | "medium")
+  when more visual detail is needed.
 
 **Output Format — respond with valid JSON only:**
 {json.dumps(REFLECTION_SCHEMA, indent=2)}"""
@@ -950,9 +1045,15 @@ Your job is to assess whether the evidence gathered so far is sufficient to answ
             task_instruction = "Based on the evidence, provide a clear answer to the question. Use option 'A' as a placeholder and put your actual answer in the 'selected_option_text' and 'reasoning' fields."
             option_instruction = "Use option 'A' as a placeholder. Put your actual answer in 'selected_option_text' and detailed explanation in 'reasoning'"
 
-        # Build optional audio enrichment block
+        # Build optional audio enrichment block.  Under AAVP2 these lines
+        # are local-Whisper transcripts at MFCC timbre boundaries (no
+        # closed-tag acoustic labels); legacy lines may still include
+        # ``Acoustic: [...]`` when loaded from older runs.
         if audio_enrichment_summary.strip():
-            audio_block = f"\n**Audio Enrichment Findings:**\n{audio_enrichment_summary}\n"
+            audio_block = (
+                "\n**Regional Speech Transcripts (local Whisper, timbre anchors):**\n"
+                f"{audio_enrichment_summary}\n"
+            )
         else:
             audio_block = ""
 

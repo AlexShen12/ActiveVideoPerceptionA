@@ -85,6 +85,12 @@ SLEEP_BETWEEN_SAMPLES="${SLEEP_BETWEEN_SAMPLES:-5}"
 # Default: first 30 videos (each may have 1–3 questions).
 MAX_VIDEOS="${MAX_VIDEOS:-30}"
 
+# ── Duration bucket (OmniVideoBench paper Fig. 3) ─────────────────────────────
+# all | short | medium | long | ultralong
+# "ultralong" = clips with duration *strictly* over 10 minutes — then take the
+# first MAX_VIDEOS of those in file order.  Default: all (no duration filter).
+OMNIVIDEO_LENGTH_BUCKET="${OMNIVIDEO_LENGTH_BUCKET:-all}"
+
 # ─────────────────────────────────────────────────────────────────────────────
 echo "=========================================="
 echo " OmniVideoBench AAVP Evaluation"
@@ -99,6 +105,7 @@ echo "  NUM_WORKERS          : ${NUM_WORKERS}"
 echo "  MAX_TURNS            : ${MAX_TURNS}"
 echo "  TIMEOUT              : ${TIMEOUT}s"
 echo "  MAX_VIDEOS           : ${MAX_VIDEOS:-all}"
+echo "  LENGTH_BUCKET        : ${OMNIVIDEO_LENGTH_BUCKET}"
 echo "  SLEEP/SAMPLE         : ${SLEEP_BETWEEN_SAMPLES}s"
 echo "=========================================="
 
@@ -125,6 +132,8 @@ if [[ "${MAX_VIDEOS:-0}" -gt 0 ]]; then
     MAX_VIDEOS_ARG="--max-videos ${MAX_VIDEOS}"
 fi
 
+LENGTH_BUCKET_ARG=(--length-bucket "${OMNIVIDEO_LENGTH_BUCKET}")
+
 # Choose --input or --parquet based on file extension.
 INPUT_ARG=""
 case "${OMNIVIDEO_INPUT}" in
@@ -136,6 +145,7 @@ python scripts/build_omnivideobench_eval_json.py \
     ${INPUT_ARG} \
     --video-root "${OMNIVIDEO_VIDEO_ROOT}" \
     --output     "${ANN_OUT}" \
+    "${LENGTH_BUCKET_ARG[@]}" \
     ${MAX_VIDEOS_ARG}
 
 echo "Annotation JSON ready: ${ANN_OUT}"

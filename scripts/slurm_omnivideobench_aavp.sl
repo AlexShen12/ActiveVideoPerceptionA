@@ -117,6 +117,12 @@ export SLEEP_BETWEEN_SAMPLES="${SLEEP_BETWEEN_SAMPLES:-5}"
 # Set to 0 to evaluate the full dataset.
 export MAX_VIDEOS="${MAX_VIDEOS:-30}"
 
+# Paper duration bucket (Fig. 3): all | short | medium | long | ultralong
+# "ultralong" = only clips *strictly* longer than 10 min, then first MAX_VIDEOS
+# in annotation order.  Default all. Example:
+#   export OMNIVIDEO_LENGTH_BUCKET=ultralong
+export OMNIVIDEO_LENGTH_BUCKET="${OMNIVIDEO_LENGTH_BUCKET:-all}"
+
 # ── Setup ─────────────────────────────────────────────────────────────────────
 mkdir -p "${REPO_ROOT}/logs"
 mkdir -p "${OUT_DIR}"

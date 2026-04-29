@@ -26,16 +26,31 @@ AAVP audio enrichment fields (all default to off/disabled):
   "audio_snippet_halfwidth_sec":  2.5,
   "audio_max_snippets_per_round": 15,
   "audio_gap_probes":             5,
-  "audio_closed_tags":            ["SILENCE", "SPEECH", ...]
+  "audio_closed_tags":            ["SILENCE", "SPEECH", ...],
+
+  "audio_cache_dir":              "",
+  "timbre_anchor_interval_sec":   15.0,
+  "timbre_window_sec":            5.0,
+  "whisper_model":                "base",
+  "whisper_device":               "auto",
+  "whisper_compute_type":         "default"
 }
 
 Notes:
 - location can be a single string or a list; config.get_random_location() picks
   one randomly per sample for load-balanced Vertex AI requests.
-- audio_enabled is the master switch: when False the Observer never calls
-  audio_utils regardless of what the planner selects.
-- audio_closed_tags must stay in sync with the enum list in prompt.py
-  (_ACOUSTIC_TAGS) and AUDIO_ENRICHMENT_SCHEMA.
+- audio_enabled is the master switch.  When False, the Observer skips both the
+  preplan timbre/ASR pass and the per-round regional ASR.
+- audio_closed_tags is retained for backward-compatible config files but is
+  unused by the new local-ASR pipeline (Gemini WAV interpretation is deprecated).
+- audio_cache_dir: directory for the per-video timbre + transcript cache.
+  Empty string ⇒ resolved at runtime to "<output_dir>/_timbre_cache" or, if
+  output_dir is also empty, to "~/.cache/avpa/timbre".
+- timbre_anchor_interval_sec: target spacing between MFCC agglomerative
+  boundaries (~one anchor per N seconds of video).
+- timbre_window_sec: total ASR window centred on each boundary (e.g. 5.0 →
+  ±2.5 s).
+- whisper_model / whisper_device / whisper_compute_type: faster-whisper knobs.
 
 Env overrides (applied after JSON, if set):
   VERTEX_PROJECT, VERTEX_LOCATION, GEMINI_MODEL, GEMINI_API_KEY
@@ -96,14 +111,42 @@ class AVPConfig:
     # Maximum number of gap probes added when audio_enrichment="evidence_plus_gaps".
     audio_gap_probes: int = 5
 
-    # Closed-vocabulary acoustic event tags.  Must stay in sync with
-    # prompt._ACOUSTIC_TAGS and AUDIO_ENRICHMENT_SCHEMA.
+    # Closed-vocabulary acoustic event tags.  Retained for backward
+    # compatibility with existing config files; the local-ASR pipeline does
+    # not consume them (Gemini WAV interpretation is deprecated).
     audio_closed_tags: List[str] = field(default_factory=lambda: [
         "SILENCE", "SPEECH", "MUSIC", "CHEER", "APPLAUSE",
         "WHISTLE", "BUZZER", "CRASH", "DOOR", "FOOTSTEPS",
         "ENGINE", "SIREN", "BELL", "TYPING", "LAUGHTER",
         "ANIMAL", "WATER", "WIND", "AMBIENT", "OTHER",
     ])
+
+    # ------------------------------------------------------------------
+    # Local timbre-anchor + faster-whisper ASR pipeline (replaces the
+    # deprecated Gemini WAV-interpretation path).
+    # ------------------------------------------------------------------
+
+    # Cache directory for per-video timbre boundaries + ASR transcripts.
+    # Empty string ⇒ resolved at runtime (see _resolve_audio_cache_dir).
+    audio_cache_dir: str = ""
+
+    # Target spacing between MFCC agglomerative boundaries.  ~1 anchor per
+    # N seconds; n_segments = max(2, ceil(duration / anchor_interval_sec)).
+    timbre_anchor_interval_sec: float = 15.0
+
+    # Total ASR window centred on each boundary (seconds).  5.0 ⇒ ±2.5 s.
+    timbre_window_sec: float = 5.0
+
+    # faster-whisper model identifier (tiny / base / small / medium / large-v3).
+    whisper_model: str = "base"
+
+    # faster-whisper device: "auto" | "cpu" | "cuda".
+    whisper_device: str = "auto"
+
+    # faster-whisper compute type: "default" | "int8" | "int8_float16"
+    # | "float16" | "float32".  "default" lets the library choose based on
+    # device.
+    whisper_compute_type: str = "default"
 
     def __post_init__(self):
         """Initialize location as list if it's a string."""
@@ -117,6 +160,20 @@ class AVPConfig:
         if not self.location:
             return "global"
         return random.choice(self.location)
+
+    def resolve_audio_cache_dir(self) -> str:
+        """Return the effective audio cache directory.
+
+        Order of preference: explicit ``audio_cache_dir`` → ``output_dir``
+        sibling ``_timbre_cache`` → user cache (``~/.cache/avpa/timbre``).
+        The directory is created lazily by callers (e.g. the cache module);
+        this method only resolves the path string.
+        """
+        if self.audio_cache_dir:
+            return str(Path(self.audio_cache_dir).expanduser())
+        if self.output_dir:
+            return str(Path(self.output_dir).expanduser() / "_timbre_cache")
+        return str(Path("~/.cache/avpa/timbre").expanduser())
 
     def get_plan_replan_model(self) -> str:
         """Get the model for planning/replanning operations."""

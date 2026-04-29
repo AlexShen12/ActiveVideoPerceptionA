@@ -71,6 +71,16 @@ from .audio_utils import (
     cleanup_audio_artifacts,
 )
 
+from .timbre_segmentation import compute_timbre_boundaries
+from .local_asr import transcribe_wav
+from .timbre_anchor_cache import (
+    TimbreAnchor,
+    preplan_anchors,
+    filter_anchors_in_regions,
+    load_cache as load_timbre_cache,
+    save_cache as save_timbre_cache,
+)
+
 from .config import (
     AVPConfig,
     load_config,
@@ -118,6 +128,15 @@ __all__ = [
     "extract_audio_region",
     "generate_gap_probes",
     "cleanup_audio_artifacts",
+
+    # Timbre boundaries + local ASR (AAVP2)
+    "compute_timbre_boundaries",
+    "transcribe_wav",
+    "TimbreAnchor",
+    "preplan_anchors",
+    "filter_anchors_in_regions",
+    "load_timbre_cache",
+    "save_timbre_cache",
 
     # Prompt management
     "PromptManager",
