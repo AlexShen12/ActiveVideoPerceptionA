@@ -81,8 +81,9 @@ fi
 # Directory containing extracted VideoMME .mp4 files.
 export VIDEO_ROOT="${VIDEO_ROOT:-/users/a/l/alshen/AVPA/ActiveVideoPerceptionA/videomme_data/data}"
 
-# Config JSON with credentials and audio_enabled=true (see avp/config.aavp.json).
-export CONFIG_FILE="${CONFIG_FILE:-${REPO_ROOT}/avp/config.json}"
+# Config JSON — default to bundled AAVP template (audio_enabled: true).
+# Override CONFIG_FILE before sbatch if you use a merged file.
+export CONFIG_FILE="${CONFIG_FILE:-${REPO_ROOT}/avp/config.aavp.json}"
 
 # Annotation JSON built from the parquet (produced in step 1 of the eval run).
 export ANN_OUT="${ANN_OUT:-${REPO_ROOT}/eval_videomme_with_paths.json}"

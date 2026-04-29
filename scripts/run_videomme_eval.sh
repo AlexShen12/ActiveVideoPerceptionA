@@ -49,9 +49,8 @@ PARQUET_FILE="${PARQUET_FILE:-${REPO_ROOT}/test-00000-of-00001.parquet}"
 # ── Output JSON (built in step 1) ────────────────────────────────────────────
 ANN_OUT="${ANN_OUT:-${REPO_ROOT}/eval_videomme_with_paths.json}"
 
-# ── Config file (copy + edit config.example.json; see note below) ────────────
-# Must have audio_enabled=true and Vertex/API credentials set.
-CONFIG_FILE="${CONFIG_FILE:-${REPO_ROOT}/avp/config.json}"
+# ── Config file (AAVP template defaults to audio_enabled: true) ────────────────
+CONFIG_FILE="${CONFIG_FILE:-${REPO_ROOT}/avp/config.aavp.json}"
 
 # ── Eval output directory ────────────────────────────────────────────────────
 OUT_DIR="${OUT_DIR:-${REPO_ROOT}/avp/out_videomme_aavp}"
@@ -101,8 +100,7 @@ fi
 # ── Guard: config must exist ─────────────────────────────────────────────────
 if [[ ! -f "${CONFIG_FILE}" ]]; then
     echo "ERROR: CONFIG_FILE not found: ${CONFIG_FILE}" >&2
-    echo "  Copy avp/config.example.json, set your credentials, and enable audio:" >&2
-    echo '    "audio_enabled": true' >&2
+    echo "  Defaults to avp/config.aavp.json — copy it, add credentials, ensure audio_enabled: true." >&2
     exit 1
 fi
 
