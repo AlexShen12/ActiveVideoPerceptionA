@@ -175,7 +175,7 @@ bash scripts/run_omnivideobench_eval.sh
 
 ## Citation
 
-If you find our work useful, please cite:
+If you find the previous work useful, please cite:
 
 ```bibtex
 @misc{wang2025activevideoperceptioniterative,
