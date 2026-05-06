@@ -1,32 +1,10 @@
-# Active Video Perception: Iterative Evidence Seeking for Agentic Long Video Understanding
-
-<div align="center">
-
-[![Homepage](https://img.shields.io/badge/Homepage-visit-9DC3E6)](https://activevideoperception.github.io/)
-[![arXiv](https://img.shields.io/badge/arXiv-2512.05774-ECA8A7?logo=arxiv)](https://arxiv.org/abs/2512.05774)
-[![Video](https://img.shields.io/badge/Video-2--min_demo-FF0000?logo=youtube)](https://www.youtube.com/watch?v=15SxSE1A0Ow)
-
-</div>
-
-
-[Ziyang Wang](https://ziyangw2000.github.io/)<sup>1,2*</sup>, [Honglu Zhou](https://sites.google.com/view/hongluzhou/)<sup>1</sup>,[Shijie Wang](https://wang-sj16.github.io/)<sup>1</sup>, [Junnan Li](https://scholar.google.com/citations?user=MuUhwi0AAAAJ&hl=en)<sup>1</sup>, [Caiming Xiong](http://cmxiong.com/)<sup>1</sup>, [Silvio Savarese](https://www.salesforce.com/blog/author/silvio-savarese/)<sup>1</sup>, [Mohit Bansal](https://www.cs.unc.edu/~mbansal/)<sup>2</sup>, [Michael S. Ryoo](https://scholar.google.com/citations?user=vcw0TJIAAAAJ&hl=en)<sup>1</sup>, [Juan Carlos Niebles](https://www.niebles.net/)<sup>1</sup>
-
-<sup>1</sup> Salesforce AI Research  
-<sup>2</sup> UNC Chapel Hill  
-<sup>*</sup> Work done during internship at Salesforce
-
----
-
-<div align="center">
-  <img src="assets/teaser.png" width="500">
-</div>
-
-<br>
 
 ## Table of Contents
 - [Highlights](#highlights)
 - [Setup](#setup)
 - [Evaluation](#evaluation)
+- [VideoMME](#videomme)
+- [OmniVideoBench](#omnivideobench)
 - [Citation](#citation)
 
 ---
@@ -34,29 +12,16 @@
 ## Highlights
 
 
-**Active Video Perception (AVP)** is an evidence-seeking framework that treats the video as an interactive environment and acquires compact, queryrelevant evidence directly from pixels.
+**Audio-Extended Active Video Perception (AVPA / AAVP)** builds on **AVP**: it still treats video as an interactive environment and gathers compact, query-relevant evidence through **active** perception, and adds a **time-aligned speech prior** (pre-observation ASR) that **informs planning**, **pairs with each visual pass**, and supports **multimodal reflection**.
 
 **Key ideas:**
 - Treat long videos as **interactive environments**
-- Iteratively **plan → observe → reflect** to seek evidence
-- Allocate computation **adaptively** to informative regions
-- Improve **grounding, efficiency, and reasoning faithfulness**
+- Iteratively **plan → observe → reflect** using **vision and speech**
+- **Adaptively** choose **where** and **how** the VLM watches each round
+- Check **cross-modal** sufficiency for **grounding** and **faithful** answers
 
-AVP consistently improves over strong MLLM backbones and prior agentic frameworks across multiple long video understanding benchmarks.
+AVPA extends AVP toward **audio-visual** and long-form video QA without replacing **iterative visual** observation.
 
-<div align="center">
-  <img src="assets/table_1.png" width="800">
-</div>
-
-<br>
-
-<div align="center">
-  <img src="assets/vis.png" width="800">
-</div>
-
-<br>
-
----
 
 ## Setup
 
@@ -76,18 +41,24 @@ ffmpeg -version
 pip install -r requirements.txt
 ```
 
-### 3. Setup Annotation Files and Config Files
+### 3. Credentials and config
 
-Before running evaluation, please download the videos from original benchmark huggingface and update the video paths of the annotation file in `avp/eval_anno/` and update the Gemini API information in `avp/config.example.json`.
+Merge your Gemini credentials into a config JSON (start from `avp/config.example.json` for video-only AVP, or `avp/config.aavp.json` for **AVPA / AAVP** with audio).
 
-For API Keys: 
+**Vertex AI:** Set `project` and `location` in the config.
 
-**Vertex AI (default):** Set `project` and `location` in config for GCP Vertex AI.
+**Google AI Studio:** Set the `GEMINI_API_KEY` environment variable or `"api_key"` in the config.
 
-**API key (Google AI Studio):** Set the `GEMINI_API_KEY` environment variable (or optional `api_key` in config).
+The benchmark driver scripts load a repo-root `.env` if present (see `scripts/dotenv.sh`). You can export the same variables in your shell instead.
+
+### 4. Optional: annotation format for custom benchmarks
+
+For ad-hoc JSON annotations, see `avp/eval_anno/` and point your run script at the file you prepared.
 
 ---
 ## Evaluation
+
+### Generic annotation JSON
 
 Set these in `avp/parrelel_run.sh` before running:
 
@@ -102,11 +73,103 @@ Optional (with defaults):
 - **NUM_WORKERS** – Number of parallel workers (default: 4)
 - **TIMEOUT** – Timeout per sample in seconds, prevent API failure (omit for no timeout, suggested to use)
 
-Example Script:
+Example:
 
 ```bash
 bash avp/parrelel_run.sh
 ```
+
+---
+
+## VideoMME
+
+These steps run **AVPA (AAVP)** on [VideoMME](https://arxiv.org/abs/2401.09115) using `scripts/run_videomme_eval.sh`: build a path-resolved eval JSON from the official **parquet** split, then launch `python -m avp.eval_parallel`.
+
+### 1. Data
+
+1. Download the **VideoMME** annotation parquet and video files from the benchmark authors (e.g. [Hugging Face — `lmms-lab/Video-MME`](https://huggingface.co/datasets/lmms-lab/Video-MME)).
+2. Extract videos so each file is named `<videoID>.mp4` (default column `videoID`) directly under one directory, e.g. `/path/to/videomme/videos/fFjv93ACGo8.mp4`.
+
+### 2. Python extras
+
+Parquet IO needs **pandas** and **pyarrow**:
+
+```bash
+pip install pandas pyarrow
+```
+
+### 3. Config
+
+Use `avp/config.aavp.json` (default for the script) or a copy with your credentials and `"audio_enabled": true` for the full audio–visual pipeline.
+
+### 4. Run
+
+```bash
+export VIDEO_ROOT=/path/to/videomme/videos
+export PARQUET_FILE=/path/to/test-00000-of-00001.parquet   # if not using repo-root default
+export CONFIG_FILE="${PWD}/avp/config.aavp.json"
+bash scripts/run_videomme_eval.sh
+```
+
+**Useful environment overrides** (see `scripts/run_videomme_eval.sh`):
+
+| Variable | Role |
+| -------- | ---- |
+| `VIDEO_ROOT` | Directory of `<videoID>.mp4` files (**required**) |
+| `PARQUET_FILE` | Input parquet (default: `${REPO_ROOT}/test-00000-of-00001.parquet`) |
+| `ANN_OUT` | Built JSON path (default: `eval_videomme_with_paths.json`) |
+| `OUT_DIR` | Worker output (default: `avp/out_videomme_aavp`) |
+| `NUM_WORKERS`, `MAX_TURNS`, `TIMEOUT` | Parallelism and per-sample limits |
+| `MAX_VIDEOS` | Pilot on first *N* unique videos (`0` = full set) |
+| `SLEEP_BETWEEN_SAMPLES` | Throttle API rate between items |
+
+If `avp/eval_anno/eval_videomme.json` is present, durations are merged automatically. Results: `${OUT_DIR}/results.jsonl` and `summary.json`.
+
+---
+
+## OmniVideoBench
+
+These steps run **AVPA (AAVP)** on [OmniVideoBench](https://huggingface.co/datasets/NJU-LINK/OmniVideoBench) (audio–visual QA). The eval script expects **`audio_enabled: true`** in your config.
+
+### 1. Download the dataset
+
+Accept the dataset license on Hugging Face and authenticate (`export HF_TOKEN=hf_...` or `huggingface-cli login`), then:
+
+```bash
+pip install -r scripts/requirements-omnivideobench.txt
+bash scripts/install_omnivideobench.sh
+```
+
+By default files go to `./omnivideobench_data` (override with `OMNIVIDEO_LOCAL_DIR`). The installer prints suggested `OMNIVIDEO_INPUT` and `OMNIVIDEO_VIDEO_ROOT` paths when it finishes.
+
+### 2. Config
+
+Use `avp/config.aavp.json` or equivalent with **`"audio_enabled": true`** (the driver verifies this unless `VERIFY_OMNI_AUDIO=0`).
+
+### 3. Run
+
+```bash
+export OMNIVIDEO_INPUT=/path/to/data.json        # or data.parquet
+export OMNIVIDEO_VIDEO_ROOT=/path/to/videos      # directory with benchmark videos
+export CONFIG_FILE="${PWD}/avp/config.aavp.json"
+bash scripts/run_omnivideobench_eval.sh
+```
+
+**Useful environment overrides** (see `scripts/run_omnivideobench_eval.sh`):
+
+| Variable | Role |
+| -------- | ---- |
+| `OMNIVIDEO_INPUT` | Nested JSON or parquet annotations (**required**) |
+| `OMNIVIDEO_VIDEO_ROOT` | Video directory (**required**) |
+| `ANN_OUT` | Built JSON (default: `eval_omnivideo_with_paths.json`) |
+| `OUT_DIR` | Worker output (default: `avp/out_omnivideo_aavp`) |
+| `MAX_VIDEOS` | Default `30` unique videos; set **`MAX_VIDEOS=0`** for the full benchmark (no cap) |
+| `OMNIVIDEO_LENGTH_BUCKET` | `all` \| `short` \| `medium` \| `long` \| `ultralong` (paper duration bins) |
+| `NUM_WORKERS`, `MAX_TURNS`, `TIMEOUT`, `SLEEP_BETWEEN_SAMPLES` | Parallelism and limits |
+
+**Cluster jobs:** See `scripts/slurm_videomme_aavp.sl` and `scripts/slurm_omnivideobench_aavp.sl` as templates; adjust paths and partitions for your site.
+
+**Aggregate sharded workers:** `python scripts/aggregate_worker_results.py <OUT_DIR> --write-merge`
 
 ---
 
